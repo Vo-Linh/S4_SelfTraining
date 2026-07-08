@@ -11,10 +11,17 @@ import os.path as osp
 import sys
 import time
 
+import cv2
+cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+
 import mmcv
 import torch
 from mmcv.runner import init_dist
 from mmcv.utils import Config, DictAction, get_git_hash
+
+# Ensure THIS repo's mmseg (with DAPCN / DAPCN_SSL registered) takes
+# precedence over any editable-installed mmseg in the venv site-packages.
+sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
 
 from mmseg import __version__
 from mmseg.apis import set_random_seed, train_segmentor
@@ -163,14 +170,24 @@ def main(args):
     model.CLASSES = datasets[0].CLASSES
     # passing checkpoint meta for saving best checkpoint
     meta.update(cfg.checkpoint_config.meta)
-    train_segmentor(
-        model,
-        datasets,
-        cfg,
-        distributed=distributed,
-        validate=(not args.no_validate),
-        timestamp=timestamp,
-        meta=meta)
+    try:
+        train_segmentor(
+            model,
+            datasets,
+            cfg,
+            distributed=distributed,
+            validate=(not args.no_validate),
+            timestamp=timestamp,
+            meta=meta)
+    except BaseException as exc:
+        # Best-effort crash notification; never mask the original error.
+        try:
+            from mmseg.core.hook.notification_hook import send_crash_email
+            send_crash_email(cfg, exc, work_dir=cfg.work_dir,
+                             timestamp=timestamp)
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == '__main__':

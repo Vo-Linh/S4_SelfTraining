@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="S4 / DAPCN-SSL Architecture" id="paper-figure">
+    <mxGraphModel dx="2400" dy="1340" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2400" pageHeight="1340" math="1" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Figure 1.  Overview of the S4 / DAPCN-SSL framework." style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=18;fontStyle=1;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="20" width="2240" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cap" value="The student $f_{\theta_s}$ is run on the labeled input (Row 1) and on the ClassMix-augmented input (Row 4), using shared weights. A frozen EMA mirror $f_{\theta_t}$ (Row 2) emits pseudo-labels on $x_u$; a DynamicAnchorModule shared across both passes (Rows 1.5 and 4.5) refines $K$ prototypes via differentiable EM and supplies a correction signal to the teacher. The four loss terms accumulate gradients in a single AdamW step." style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontStyle=2;fontColor=#333333;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="120" y="55" width="2160" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- ROW 1 — labeled forward -->
+        <mxCell id="r1lab" value="Row 1   labeled forward    (Steps 1–2)" style="text;html=1;align=left;verticalAlign=middle;fontSize=10;fontStyle=2;fontColor=#82b366;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="120" width="400" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="inLab" value="$x_l,\,y_l$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#eaf3ff;strokeColor=#5c8fd6;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="140" width="180" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="stuEnc" value="Encoder" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dfeed1;strokeColor=#6aa84f;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="290" y="140" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="stuDec" value="Decoder" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dfeed1;strokeColor=#6aa84f;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="510" y="140" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="stuHead" value="$\text{conv}_\text{seg}$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9e3c0;strokeColor=#d79b00;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="730" y="140" width="140" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="stuLog" value="$p_S$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#eaf3ff;strokeColor=#5c8fd6;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="890" y="140" width="120" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="lossCElab" value="$\mathcal{L}_{\text{CE}}^{\,\text{lab}}$&#xa;CE$(p_S, y_l)$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fbe9e7;strokeColor=#b85450;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="170" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_r1_1" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="inLab" target="stuEnc"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r1_2" value="$\{f_i\}$" style="endArrow=open;html=1;fontSize=10;fontFamily=Times New Roman;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="stuEnc" target="stuDec"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r1_3" value="$f_l$" style="endArrow=open;html=1;fontSize=10;fontFamily=Times New Roman;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="stuDec" target="stuHead"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r1_4" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="stuHead" target="stuLog"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r1_5" value="" style="endArrow=open;html=1;strokeColor=#b85450;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="stuLog" target="lossCElab"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ROW 1.5 — DA-1 (operates on f_l) -->
+        <mxCell id="r15lab" value="Row 1.5   DynamicAnchor on $f_l$    (Step 2 — shared module)" style="text;html=1;align=left;verticalAlign=middle;fontSize=10;fontStyle=2;fontColor=#9673a6;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="278" width="600" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="daBox1" value="DynamicAnchorModule    $P\!T \in \mathbb{R}^{K\times C},\ K{=}96$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f4ecf7;strokeColor=#7b4f9d;fontSize=11;fontStyle=1;fontFamily=Times New Roman;verticalAlign=top;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="510" y="298" width="440" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="daE1" value="E-step:&#xa;$a_{ij}{=}\underset{i}{\text{softmax}}\!\left(\!\frac{\cos(f_j,P\!T_i)}{\tau}\!\right)$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e8dbef;strokeColor=#7b4f9d;fontSize=10;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="525" y="328" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="daM1" value="M-step:&#xa;$P\!T_i \leftarrow \frac{\sum_j a_{ij} f_j}{\sum_j a_{ij}}$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e8dbef;strokeColor=#7b4f9d;fontSize=10;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="525" y="388" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="daQ1" value="Q-gate:&#xa;$q_i{=}\sigma(\text{MLP}(P\!T_i))$&#xa;&#xa;outputs: $A, P\!T, q$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e8dbef;strokeColor=#7b4f9d;fontSize=10;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="735" y="328" width="200" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="lossDAlab" value="$\mathcal{L}_{\text{DAPCN}}^{\,\text{lab}}$&#xa;$\lambda_b\,\mathcal{L}_{\text{bnd}} + \lambda_p\,\mathcal{L}_{\text{DAPG}}$ on $f_l$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fbe9e7;strokeColor=#b85450;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="340" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- stuDec → DA-1 (short vertical down) -->
+        <mxCell id="e_dec_da1" value="$f_l$" style="endArrow=open;html=1;strokeColor=#7b4f9d;fontSize=10;fontStyle=2;fontColor=#7b4f9d;fontFamily=Times New Roman;exitX=0.5;exitY=1;entryX=0.25;entryY=0;" edge="1" parent="1" source="stuDec" target="daBox1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <!-- DA-1 → L_DAPCN_lab (horizontal right) -->
+        <mxCell id="e_da1_loss" value="" style="endArrow=open;html=1;strokeColor=#b85450;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="daBox1" target="lossDAlab"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- EMA annotation between row 1 and row 2 -->
+        <mxCell id="emaNote" value="$\dotsm$  Teacher is the EMA copy of the student: $\theta_t \leftarrow \alpha\,\theta_t + (1-\alpha)\,\theta_s,\ \alpha{=}0.999$,  applied at the start of every iteration (Step 0).  $\dotsm$" style="text;html=1;align=center;verticalAlign=middle;fontSize=10;fontStyle=2;fontColor=#d79b00;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="465" width="1260" height="14" as="geometry" />
+        </mxCell>
+
+        <!-- ROW 2 — teacher forward -->
+        <mxCell id="r2lab" value="Row 2   teacher forward    (Step 3,  no grad — frozen $\dagger$)" style="text;html=1;align=left;verticalAlign=middle;fontSize=10;fontStyle=2;fontColor=#d79b00;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="488" width="600" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="inUnl" value="$x_u$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#eaf3ff;strokeColor=#5c8fd6;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="508" width="180" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="teaEnc" value="Encoder$^\dagger$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9e3c0;strokeColor=#d79b00;fontSize=12;fontFamily=Times New Roman;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="290" y="508" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="teaDec" value="Decoder$^\dagger$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9e3c0;strokeColor=#d79b00;fontSize=12;fontFamily=Times New Roman;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="510" y="508" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="teaHead" value="$\text{conv}_\text{seg}^\dagger$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9e3c0;strokeColor=#d79b00;fontSize=12;fontFamily=Times New Roman;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="730" y="508" width="140" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="teaPT" value="$p_T$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#bf9000;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="890" y="508" width="120" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="corrBox" value="Prototype correction (3b)&#xa;$p^c{=}A\cdot\text{softmax}(\text{conv}_\text{seg}(P\!T))$&#xa;$p_T \leftarrow (1-\alpha_c)p_T + \alpha_c p^c$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f4ecf7;strokeColor=#7b4f9d;fontSize=10;align=left;spacingLeft=8;spacingRight=8;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="508" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="pseuBox" value="$\hat{y},\hat{p}{=}\max(p_T)$&#xa;$w{=}\mathbf{1}[\hat{p}{>}\tau]\cdot\min(1,t/T_w)$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#bf9000;fontSize=10;align=left;spacingLeft=8;spacingRight=8;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="578" width="300" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Row 2 arrows: input → teacher pipeline → correction → pseudo-label -->
+        <mxCell id="e_r2_1" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="inUnl" target="teaEnc"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r2_2" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="teaEnc" target="teaDec"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r2_3" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="teaDec" target="teaHead"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r2_4" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="teaHead" target="teaPT"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r2_5" value="$p_T$" style="endArrow=open;html=1;fontSize=10;fontFamily=Times New Roman;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="teaPT" target="corrBox"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r2_6" value="" style="endArrow=open;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="corrBox" target="pseuBox"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- DA-1 outputs (A, PT) feed prototype correction. Route: down from daBox1 right-bottom to corrBox left -->
+        <mxCell id="e_da1_corr" value="$A,P\!T$" style="endArrow=open;html=1;strokeColor=#7b4f9d;fontSize=10;fontStyle=2;fontColor=#7b4f9d;fontFamily=Times New Roman;exitX=1;exitY=1;entryX=0;entryY=0.5;" edge="1" parent="1" source="daBox1" target="corrBox">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="990" y="538" /></Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ROW 3 — ClassMix -->
+        <mxCell id="r3lab" value="Row 3   ClassMix    (Step 4)" style="text;html=1;align=left;verticalAlign=middle;fontSize=10;fontStyle=2;fontColor=#45818e;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="650" width="600" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="cmBox" value="ClassMix    binary mask $M$ from random subset of classes in $y_l$&#xa;$x_m = M{\odot}x_l + (1{-}M){\odot}x_u$         $y_m = M{\odot}y_l + (1{-}M){\odot}\hat{y}$         $w_m = M{\odot}\mathbf{1} + (1{-}M){\odot}w$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e2efef;strokeColor=#45818e;fontSize=11;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="670" width="1260" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- pseudo-label box → ClassMix (short vertical down on right side) -->
+        <mxCell id="e_pseu_cm" value="$\hat{y},w$" style="endArrow=open;html=1;strokeColor=#45818e;fontSize=10;fontStyle=2;fontColor=#45818e;fontFamily=Times New Roman;exitX=0.5;exitY=1;entryX=0.9;entryY=0;" edge="1" parent="1" source="pseuBox" target="cmBox"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ROW 4 — mixed forward -->
+        <mxCell id="r4lab" value="Row 4   mixed forward    (Steps 5–6 — shared $\theta_s$)" style="text;html=1;align=left;verticalAlign=middle;fontSize=10;fontStyle=2;fontColor=#82b366;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="765" width="600" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="inMix" value="$x_m,\,y_m,\,w_m$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e2efef;strokeColor=#45818e;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="785" width="180" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="mixEnc" value="Encoder" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dfeed1;strokeColor=#6aa84f;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="290" y="785" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="mixDec" value="Decoder" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dfeed1;strokeColor=#6aa84f;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="510" y="785" width="200" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="mixHead" value="$\text{conv}_\text{seg}$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f9e3c0;strokeColor=#d79b00;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="730" y="785" width="140" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="mixLog" value="$p_S^{\,\text{mix}}$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#eaf3ff;strokeColor=#5c8fd6;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="890" y="785" width="120" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="lossCEmix" value="$\mathcal{L}_{\text{CE}}^{\,\text{mix}}$&#xa;CE$(p_S^{\,\text{mix}}, y_m;\,w_m)$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fbe9e7;strokeColor=#b85450;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="810" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Row 4 chain arrows -->
+        <mxCell id="e_r4_1" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="inMix" target="mixEnc"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r4_2" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="mixEnc" target="mixDec"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r4_3" value="$f_m$" style="endArrow=open;html=1;fontSize=10;fontFamily=Times New Roman;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="mixDec" target="mixHead"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r4_4" value="" style="endArrow=open;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="mixHead" target="mixLog"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_r4_5" value="" style="endArrow=open;html=1;strokeColor=#b85450;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="mixLog" target="lossCEmix"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ClassMix → inMix (short vertical down) -->
+        <mxCell id="e_cm_inmix" value="" style="endArrow=open;html=1;strokeColor=#45818e;exitX=0.07;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="cmBox" target="inMix"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- shared θ_s annotation (between row 1 student boxes and row 4 student boxes) -->
+        <mxCell id="sharedW" value="$\theta_s$ shared $\dotsm\dotsm\dotsm\dotsm$  (one parameter set, two forward passes)  $\dotsm\dotsm\dotsm\dotsm$" style="text;html=1;align=left;verticalAlign=middle;fontSize=9;fontStyle=2;fontColor=#82b366;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="290" y="770" width="720" height="12" as="geometry" />
+        </mxCell>
+
+        <!-- ROW 4.5 — DA-2 (operates on f_m) -->
+        <mxCell id="r45lab" value="Row 4.5   DynamicAnchor on $f_m$    (Step 6 — same module, shared $\theta_{DA}$)" style="text;html=1;align=left;verticalAlign=middle;fontSize=10;fontStyle=2;fontColor=#9673a6;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="923" width="700" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="daBox2" value="DynamicAnchorModule    (same instance as Row 1.5)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f4ecf7;strokeColor=#7b4f9d;fontSize=11;fontStyle=1;fontFamily=Times New Roman;verticalAlign=top;spacingTop=6;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="510" y="943" width="440" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="da2body" value="E-step / M-step / Q-gate on $f_m$     →     outputs $A, P\!T, q$&#xa;applied with weight $w_m$  (mixed pseudo-weights)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#e8dbef;strokeColor=#7b4f9d;fontSize=10;fontFamily=Times New Roman;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="525" y="975" width="410" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="lossDAmix" value="$\mathcal{L}_{\text{DAPCN}}^{\,\text{mix}}$&#xa;$\lambda_b\,\mathcal{L}_{\text{bnd}} + \lambda_p\,\mathcal{L}_{\text{DAPG}}$ on $f_m$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fbe9e7;strokeColor=#b85450;fontSize=12;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="970" width="320" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- mixDec → DA-2 -->
+        <mxCell id="e_mdec_da2" value="$f_m$" style="endArrow=open;html=1;strokeColor=#7b4f9d;fontSize=10;fontStyle=2;fontColor=#7b4f9d;fontFamily=Times New Roman;exitX=0.5;exitY=1;entryX=0.25;entryY=0;" edge="1" parent="1" source="mixDec" target="daBox2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <!-- DA-2 → L_DAPCN_mix -->
+        <mxCell id="e_da2_loss" value="" style="endArrow=open;html=1;strokeColor=#b85450;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="daBox2" target="lossDAmix"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ===== Σ + Optimizer ===== -->
+        <mxCell id="sumNode" value="$\sum$" style="ellipse;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;fontSize=20;fontStyle=1;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1720" y="1080" width="80" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="optBox" value="AdamW update&#xa;$\theta_s \leftarrow \theta_s - \eta\,\nabla_{\!\theta_s}\!\sum \mathcal{L},\ \ \eta{=}6{\times}10^{-5}$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dfeed1;strokeColor=#6aa84f;fontSize=12;fontStyle=1;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="1840" y="1080" width="480" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- 4 loss boxes → Σ.  Each loss is at x=1340-1660, Σ left edge x=1720. Short horizontal right then converge. -->
+        <mxCell id="e_l1_sum" value="" style="endArrow=open;html=1;strokeColor=#b85450;strokeWidth=1.2;exitX=1;exitY=0.5;entryX=0;entryY=0.2;" edge="1" parent="1" source="lossCElab" target="sumNode"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_l2_sum" value="" style="endArrow=open;html=1;strokeColor=#b85450;strokeWidth=1.2;exitX=1;exitY=0.5;entryX=0;entryY=0.4;" edge="1" parent="1" source="lossDAlab" target="sumNode"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_l3_sum" value="" style="endArrow=open;html=1;strokeColor=#b85450;strokeWidth=1.2;exitX=1;exitY=0.5;entryX=0;entryY=0.6;" edge="1" parent="1" source="lossCEmix" target="sumNode"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_l4_sum" value="" style="endArrow=open;html=1;strokeColor=#b85450;strokeWidth=1.2;exitX=1;exitY=0.5;entryX=0;entryY=0.8;" edge="1" parent="1" source="lossDAmix" target="sumNode"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_sum_opt" value="$\nabla\!\sum\mathcal{L}$" style="endArrow=open;html=1;strokeColor=#6aa84f;strokeWidth=2;fontSize=11;fontStyle=2;fontColor=#6aa84f;fontFamily=Times New Roman;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="sumNode" target="optBox"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ===== Hyperparams + legend strip (bottom left) ===== -->
+        <mxCell id="hp" value="Hyperparameters:    $\alpha{=}0.999\quad \tau{=}0.968\quad T_w{=}1000\quad \lambda_b{=}0.5\quad \lambda_p{=}0.1\quad K{=}96\quad \alpha_c{=}0.5\quad$ correction starts at $t{=}1000\quad$ crop $512^2,\ T_{\max}{=}40\text{k}$" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#bbbbbb;fontSize=10;align=left;spacingLeft=10;spacingRight=10;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1170" width="1620" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="legend" value="Notation:    $\dagger$ frozen (no grad)    solid = forward / data flow    purple = DynamicAnchor    red = loss    teal = ClassMix    orange = teacher / EMA" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontStyle=2;fontColor=#666666;fontFamily=Times New Roman;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1220" width="2240" height="20" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

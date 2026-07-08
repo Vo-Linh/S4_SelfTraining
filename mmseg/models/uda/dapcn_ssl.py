@@ -40,7 +40,8 @@ from mmseg.core import add_prefix
 from mmseg.models import UDA, build_segmentor, build_loss
 from mmseg.models.builder import MODELS
 from mmseg.models.uda.uda_decorator import UDADecorator, get_module
-from mmseg.models.uda.utils.dapcn_utils import (
+from mmseg.models.uda.dwpc_mixin import DWPCMixin
+from mmseg.models.utils.dapcn_utils import (
     compute_boundary_gt,
     extract_boundary_map,
 )
@@ -49,10 +50,15 @@ from mmseg.models.utils.dacs_transforms import (
     get_mean_std,
     strong_transform,
 )
+from mmseg.models.utils.prototype_memory import (
+    PrototypeMemory,
+    prototype_contrastive_loss,
+    prototype_contrastive_loss_extended,
+)
 
 
 @UDA.register_module()
-class DAPCN_SSL(UDADecorator):
+class DAPCN_SSL(DWPCMixin, UDADecorator):
     """Semi-Supervised DAPCN for satellite image segmentation.
 
     Uses the same self-training framework as UDA-DAPCN but operates
@@ -136,10 +142,30 @@ class DAPCN_SSL(UDADecorator):
                  proto_correction_alpha=0.5,
                  proto_correction_start_iter=1000,
                  anchor_after_fusion=False,
+                 # PrototypeMemory + class-conditioned contrastive loss
+                 contrastive_lambda=0.0,
+                 contrastive_temp=0.07,
+                 num_prototypes_per_class=1,
+                 prototype_ema=0.999,
+                 prototype_init_strategy='zeros',
+                 # Extended contrastive objective (v2):
+                 #   - contrastive_use_teacher: feed EMA-teacher confident
+                 #     pseudo-labels into the memory bank as additional
+                 #     supervision. Without this, the bank only sees the
+                 #     labeled subset and quickly self-equilibrates.
+                 #   - contrastive_use_dynanchor_negatives: use DynAnchor's
+                 #     dataset-level prototypes as a hard-negative bank,
+                 #     turning the N-way (N=num_classes) discrimination
+                 #     into (N + K_dyn)-way against class-agnostic but
+                 #     manifold-spanning negatives.
+                 contrastive_use_teacher=False,
+                 contrastive_use_dynanchor_negatives=False,
                  # Sub-module configs
                  dynamic_anchor=None,
                  dapg_loss=None,
                  affinity_loss=None,
+                 # DWPC dual-witness pseudo-label correction
+                 dwpc=None,
                  **cfg):
         super(DAPCN_SSL, self).__init__(**cfg)
 
@@ -174,6 +200,16 @@ class DAPCN_SSL(UDADecorator):
         self.proto_correction_start_iter = proto_correction_start_iter
         self.anchor_after_fusion = anchor_after_fusion
 
+        # Class-conditioned PrototypeMemory + InfoNCE contrastive
+        self.contrastive_lambda = contrastive_lambda
+        self.contrastive_temp = contrastive_temp
+        self.num_prototypes_per_class = num_prototypes_per_class
+        self.prototype_ema = prototype_ema
+        self.prototype_init_strategy = prototype_init_strategy
+        self.contrastive_use_teacher = contrastive_use_teacher
+        self.contrastive_use_dynanchor_negatives = (
+            contrastive_use_dynanchor_negatives)
+
         # EMA teacher model
         ema_cfg = deepcopy(cfg['model'])
         self.ema_model = build_segmentor(ema_cfg)
@@ -202,7 +238,32 @@ class DAPCN_SSL(UDADecorator):
                 loss_weight=1.0,
             ))
 
+        # PrototypeMemory bank for class-conditioned contrastive loss.
+        # Lives in the same feature space DynAnchor uses (encoder[-1] for
+        # Solution 1 or fused decoder for Solution 2).
+        self.proto_memory = None
+        if self.contrastive_lambda > 0:
+            decode_head = self.get_model().decode_head
+            num_classes = decode_head.num_classes
+            if self.anchor_after_fusion:
+                proto_dim = decode_head.channels
+            else:
+                in_ch = decode_head.in_channels
+                proto_dim = in_ch[-1] if isinstance(in_ch, (list, tuple)) \
+                    else in_ch
+            self.proto_memory = PrototypeMemory(
+                num_classes=num_classes,
+                feature_dim=proto_dim,
+                num_prototypes_per_class=num_prototypes_per_class,
+                ema=prototype_ema,
+                init_strategy=prototype_init_strategy,
+            )
+
         self.class_probs = {}
+
+        # DWPC dual-witness pseudo-label correction (mixin). Reuses
+        # self.proto_memory (Witness A) + new structural witness buffers.
+        self._dwpc_init(dwpc, self.get_model().decode_head.num_classes)
 
     def _init_dynamic_anchor(self):
         """Build DynamicAnchorModule, auto-detecting feature_dim.
@@ -355,7 +416,7 @@ class DAPCN_SSL(UDADecorator):
         return min(1.0, self.local_iter / self.pseudo_label_warmup_iters)
 
     def _correct_pseudo_labels(self, target_img, target_img_metas,
-                               ema_softmax):
+                               ema_softmax, student_feat=None):
         """Correct pseudo-labels using prototype-derived class distributions.
 
         The DynamicAnchorModule learns K prototypes {PT_i} that capture
@@ -384,9 +445,11 @@ class DAPCN_SSL(UDADecorator):
             Tensor: Corrected softmax probabilities (B, num_classes, H, W).
         """
         # --- Step 1: Extract student features from unlabeled images ---
-        # Use the student model's encoder (no gradient needed for extraction)
-        with torch.no_grad():
-            student_feat = self.get_model().extract_feat(target_img)
+        # Caller may pre-extract and pass in to avoid a redundant forward
+        # when the v2 contrastive teacher path also needs these features.
+        if student_feat is None:
+            with torch.no_grad():
+                student_feat = self.get_model().extract_feat(target_img)
 
         # Get features in the appropriate space for DynAnchor
         # Solution 1: encoder[-1] (512-d), Solution 2: fused (256-d)
@@ -438,7 +501,10 @@ class DAPCN_SSL(UDADecorator):
         return blended
 
     def _compute_dapcn_losses(self, logits, seg_label, decoder_features,
-                              is_labeled=True, pseudo_weight=None):
+                              is_labeled=True, pseudo_weight=None,
+                              unlabeled_decoder_features=None,
+                              teacher_pseudo_label=None,
+                              teacher_high_conf_mask=None):
         """Compute DAPCN losses (boundary + prototype grouping).
 
         Args:
@@ -480,6 +546,11 @@ class DAPCN_SSL(UDADecorator):
                 losses['loss_boundary'] = self.boundary_lambda * boundary_loss
 
         # --- Prototype grouping loss ---
+        # Cache the EM-refined DA prototypes from this step so the
+        # contrastive block below can reuse them as live hard negatives
+        # (they're adapted to THIS batch's feature distribution rather
+        # than the static xavier seed).
+        dyn_proto_refined = None
         if self.proto_lambda > 0:
             if is_labeled or self.apply_proto_on_target:
                 # Get features in the DynAnchor's native space
@@ -488,6 +559,7 @@ class DAPCN_SSL(UDADecorator):
                 feats_flat = anchor_feat.permute(0, 2, 3, 1).reshape(-1, C)
 
                 assign, proto, quality = self.dynamic_anchor(anchor_feat)
+                dyn_proto_refined = proto
                 loss_proto, loss_dict = self.dapg_loss_fn(
                     feats_flat, assign, proto, quality)
 
@@ -495,7 +567,131 @@ class DAPCN_SSL(UDADecorator):
                 losses.update({
                     f'proto_{k}': v for k, v in loss_dict.items()})
 
+        # --- Class-conditioned prototype contrastive loss (labeled only) ---
+        # Skipped on mixed/unlabeled CE step because the query features
+        # need reliable supervision; teacher pseudo-labels enter via the
+        # memory-bank update path instead, not as queries.
+        if (is_labeled and self.contrastive_lambda > 0
+                and self.proto_memory is not None):
+            anchor_feat = self._get_anchor_features(decoder_features)
+            _, C_proto, Hf, Wf = anchor_feat.shape
+            feats_flat = anchor_feat.permute(0, 2, 3, 1).reshape(-1, C_proto)
+            if seg_label_resized.shape[-2:] != (Hf, Wf):
+                labels_proto = F.interpolate(
+                    seg_label_resized.float().unsqueeze(1),
+                    size=(Hf, Wf), mode='nearest').long().squeeze(1)
+            else:
+                labels_proto = seg_label_resized
+            labels_flat = labels_proto.reshape(-1)
+            valid_mask = labels_flat != self.ignore_index
+
+            # 1. Update memory bank from LABELED GT features (always)
+            self.proto_memory.update(
+                feats_flat.detach(), labels_flat, mask=valid_mask)
+
+            # 2. Optionally update bank from TEACHER-confident pseudo-
+            #    labeled features (v2). This injects 3500-image worth of
+            #    feature statistics into the bank, breaking the self-
+            #    referential equilibrium of the labeled-only bank.
+            if (self.contrastive_use_teacher
+                    and unlabeled_decoder_features is not None
+                    and teacher_pseudo_label is not None
+                    and teacher_high_conf_mask is not None):
+                un_anchor = self._get_anchor_features(
+                    unlabeled_decoder_features)
+                _, _, Hu, Wu = un_anchor.shape
+                un_feats_flat = un_anchor.permute(
+                    0, 2, 3, 1).reshape(-1, C_proto)
+                if teacher_pseudo_label.shape[-2:] != (Hu, Wu):
+                    tp = F.interpolate(
+                        teacher_pseudo_label.float().unsqueeze(1),
+                        size=(Hu, Wu), mode='nearest').long().squeeze(1)
+                else:
+                    tp = teacher_pseudo_label
+                if teacher_high_conf_mask.shape[-2:] != (Hu, Wu):
+                    tm = F.interpolate(
+                        teacher_high_conf_mask.float().unsqueeze(1),
+                        size=(Hu, Wu), mode='nearest').squeeze(1).bool()
+                else:
+                    tm = teacher_high_conf_mask.bool()
+                un_labels_flat = tp.reshape(-1)
+                un_mask_flat = tm.reshape(-1)
+                self.proto_memory.update(
+                    un_feats_flat.detach(), un_labels_flat, mask=un_mask_flat)
+
+            # 3. Compose the InfoNCE objective.
+            use_ext = (
+                self.contrastive_use_dynanchor_negatives
+                and self.dynamic_anchor is not None
+                and self.dynamic_anchor.feature_dim == C_proto
+            )
+            if use_ext:
+                # Hard-negative bank: the *EM-refined* DA prototypes
+                # produced in the L_proto block above. These cluster
+                # in the regions of feature-space the queries actually
+                # occupy — genuine hard negatives, not static random
+                # vectors. ``detach()`` so the contrastive gradient
+                # does NOT reshape the DA geometry (DAPGLoss owns that).
+                if dyn_proto_refined is not None:
+                    extra_neg = dyn_proto_refined.detach()
+                else:
+                    # Cold path: L_proto wasn't computed this step
+                    # (proto_lambda=0). Run DA on the labeled features
+                    # ourselves, no_grad since we're only using it as
+                    # a negative bank, not optimizing through it.
+                    with torch.no_grad():
+                        _, dyn_p, _ = self.dynamic_anchor(anchor_feat)
+                    extra_neg = dyn_p.detach()
+                loss_c = prototype_contrastive_loss_extended(
+                    features=feats_flat,
+                    class_prototypes=self.proto_memory(),
+                    extra_negatives=extra_neg,
+                    labels=labels_flat,
+                    num_classes=self.proto_memory.num_classes,
+                    num_prototypes_per_class=self.num_prototypes_per_class,
+                    temperature=self.contrastive_temp,
+                    ignore_index=self.ignore_index,
+                )
+            else:
+                loss_c = prototype_contrastive_loss(
+                    features=feats_flat,
+                    prototypes=self.proto_memory(),
+                    labels=labels_flat,
+                    num_classes=self.proto_memory.num_classes,
+                    num_prototypes_per_class=self.num_prototypes_per_class,
+                    temperature=self.contrastive_temp,
+                    ignore_index=self.ignore_index,
+                )
+            losses['loss_contrastive'] = self.contrastive_lambda * loss_c
+
         return losses
+
+    def _align_affinity_inputs(self, feat, seg_label_resized,
+                               pseudo_weight_resized):
+        """Resize labels (and pseudo_weight) to match feat's spatial dims.
+
+        AffinityBoundaryLoss requires features and seg_label at the same
+        H, W. decoder_features[-1] is the 1/32-scale encoder output but
+        seg_label_resized is at logits resolution (1/4). Without this
+        alignment the loss errors with a size mismatch.
+        """
+        _, _, Hf, Wf = feat.shape
+        if seg_label_resized.shape[-2:] != (Hf, Wf):
+            aff_label = F.interpolate(
+                seg_label_resized.float().unsqueeze(1),
+                size=(Hf, Wf), mode='nearest').long().squeeze(1)
+        else:
+            aff_label = seg_label_resized
+        if pseudo_weight_resized is None:
+            return aff_label, None
+        pw = pseudo_weight_resized
+        if pw.dim() == 4:
+            pw = pw.squeeze(1)  # (B, H, W)
+        if pw.shape[-2:] != (Hf, Wf):
+            pw = F.interpolate(
+                pw.unsqueeze(1), size=(Hf, Wf),
+                mode='bilinear', align_corners=False).squeeze(1)
+        return aff_label, pw
 
     def _compute_boundary_loss(self, logits, seg_label_resized,
                                decoder_features, is_labeled,
@@ -514,9 +710,11 @@ class DAPCN_SSL(UDADecorator):
             return F.binary_cross_entropy(b_pred, b_gt.float())
 
         elif mode == 'affinity':
+            feat = decoder_features[-1]
+            aff_label, aff_pw = self._align_affinity_inputs(
+                feat, seg_label_resized, pseudo_weight_resized)
             return self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_pw)
 
         elif mode == 'hybrid':
             b_pred = extract_boundary_map(logits, mode=self.boundary_mode)
@@ -528,9 +726,11 @@ class DAPCN_SSL(UDADecorator):
                     b_pred, b_gt.float(), weight=w)
             else:
                 binary_l = F.binary_cross_entropy(b_pred, b_gt.float())
+            feat = decoder_features[-1]
+            aff_label, aff_pw = self._align_affinity_inputs(
+                feat, seg_label_resized, pseudo_weight_resized)
             affinity_l = self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_pw)
             hw = self.hybrid_binary_weight
             return hw * binary_l + (1 - hw) * affinity_l
 
@@ -563,7 +763,11 @@ class DAPCN_SSL(UDADecorator):
         log_vars = {}
         batch_size = img.shape[0]
         dev = img.device
-        has_dapcn = self.boundary_lambda > 0 or self.proto_lambda > 0
+        has_dapcn = (
+            self.boundary_lambda > 0
+            or self.proto_lambda > 0
+            or self.contrastive_lambda > 0
+        )
 
         # Init/update EMA teacher
         if self.local_iter == 0:
@@ -590,19 +794,11 @@ class DAPCN_SSL(UDADecorator):
         log_vars.update(clean_log_vars)
         clean_loss.backward(retain_graph=has_dapcn)
 
-        # === Step 2: DAPCN losses on labeled images ===
-        if has_dapcn:
-            src_logits = self.get_model().decode_head(src_feat)
-            src_dapcn_losses = self._compute_dapcn_losses(
-                src_logits, gt_semantic_seg, src_feat,
-                is_labeled=True, pseudo_weight=None)
-            if src_dapcn_losses:
-                src_dapcn_loss, src_dapcn_log = self._parse_losses(
-                    src_dapcn_losses)
-                log_vars.update(src_dapcn_log)
-                src_dapcn_loss.backward()
-
-        # === Step 3: Pseudo-label generation on unlabeled ===
+        # === Step 3 (moved before step 2): Pseudo-label generation ===
+        # We compute pseudo-labels BEFORE the labeled DAPCN losses so
+        # that the v2 contrastive objective can use teacher-confident
+        # pseudo-labels to update the prototype memory bank from
+        # unlabeled features at the labeled step (step 2).
         for m in self.get_ema_model().modules():
             if isinstance(m, _DropoutNd):
                 m.training = False
@@ -613,38 +809,77 @@ class DAPCN_SSL(UDADecorator):
             target_img, target_img_metas)
         ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
 
-        # === Step 3b: Prototype-based pseudo-label correction ===
-        # Correct teacher predictions using prototype class distributions.
-        # p^c_j = sum_i f_theta(PT_i) * a_ij
-        # Activated only when:
-        #   - proto_correction is enabled
-        #   - DynamicAnchorModule exists (proto_lambda > 0)
-        #   - Training has passed proto_correction_start_iter
-        use_correction = (
+        # Determine whether we need student features on target_img.
+        # Shared by (a) v2 contrastive teacher-pseudo-label bank update,
+        # (b) prototype-based pseudo-label correction. One no_grad
+        # forward serves both — avoid duplicate work.
+        need_contrastive_teacher = (
+            self.contrastive_use_teacher
+            and self.proto_memory is not None
+            and self.contrastive_lambda > 0)
+        need_proto_correction = (
             self.proto_correction
             and self.dynamic_anchor is not None
-            and self.local_iter >= self.proto_correction_start_iter
-        )
-        if use_correction:
+            and self.local_iter >= self.proto_correction_start_iter)
+        need_dwpc = self._dwpc_needed(self.local_iter)
+        student_unlab_feat = None
+        if need_contrastive_teacher or need_proto_correction or need_dwpc:
+            with torch.no_grad():
+                student_unlab_feat = self.get_model().extract_feat(target_img)
+
+        # === Step 3b: Prototype-based pseudo-label correction ===
+        if need_proto_correction:
             ema_softmax = self._correct_pseudo_labels(
-                target_img, target_img_metas, ema_softmax)
+                target_img, target_img_metas, ema_softmax,
+                student_feat=student_unlab_feat)
 
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
         ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
         ps_size = np.size(np.array(pseudo_label.cpu()))
-        pseudo_weight = torch.sum(ps_large_p).item() / ps_size
-        pseudo_weight = pseudo_weight * torch.ones(
-            pseudo_prob.shape, device=dev)
+        scalar_pseudo_weight = torch.sum(ps_large_p).item() / ps_size
 
-        # Apply warmup scaling to pseudo-label weight
         warmup_scale = self._get_pseudo_weight_scale()
-        pseudo_weight = pseudo_weight * warmup_scale
+
+        # Teacher-confident mask feeds the (uncorrected) bank update at
+        # step 2 — keep it on the raw teacher prediction.
+        teacher_high_conf_mask = ps_large_p if need_contrastive_teacher else None
+
+        # === Step 3b: DWPC dual-witness correction (flip + per-pixel w_i) ===
+        # Replaces the scalar broadcast weight with a genuine per-pixel
+        # weight and the teacher pseudo-label with the corrected label.
+        if need_dwpc:
+            corrected_label, pseudo_weight = self._dwpc_correct(
+                ema_softmax, student_unlab_feat, self.local_iter,
+                scalar_pseudo_weight)
+            pseudo_label = corrected_label
+            pseudo_weight = pseudo_weight * warmup_scale
+        else:
+            pseudo_weight = scalar_pseudo_weight * torch.ones(
+                pseudo_prob.shape, device=dev)
+            pseudo_weight = pseudo_weight * warmup_scale
 
         if self.psweight_ignore_top > 0:
             pseudo_weight[:, :self.psweight_ignore_top, :] = 0
         if self.psweight_ignore_bottom > 0:
             pseudo_weight[:, -self.psweight_ignore_bottom:, :] = 0
         gt_pixel_weight = torch.ones(pseudo_weight.shape, device=dev)
+
+        # === Step 2: DAPCN losses on labeled images ===
+        if has_dapcn:
+            src_logits = self.get_model().decode_head(src_feat)
+            src_dapcn_losses = self._compute_dapcn_losses(
+                src_logits, gt_semantic_seg, src_feat,
+                is_labeled=True, pseudo_weight=None,
+                unlabeled_decoder_features=(
+                    student_unlab_feat if need_contrastive_teacher else None),
+                teacher_pseudo_label=(
+                    pseudo_label if need_contrastive_teacher else None),
+                teacher_high_conf_mask=teacher_high_conf_mask)
+            if src_dapcn_losses:
+                src_dapcn_loss, src_dapcn_log = self._parse_losses(
+                    src_dapcn_losses)
+                log_vars.update(src_dapcn_log)
+                src_dapcn_loss.backward()
 
         # === Step 4: ClassMix augmentation ===
         # Mix labeled patches into unlabeled images for consistency

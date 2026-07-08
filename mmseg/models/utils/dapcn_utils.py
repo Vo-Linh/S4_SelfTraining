@@ -42,10 +42,14 @@ def extract_boundary_map(logits, mode='sobel'):
         # Compute gradient magnitude
         grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2)
 
-        # Sum over classes and normalize
         boundary = torch.sum(grad_mag, dim=1, keepdim=True)
-        boundary = boundary / (boundary.amax(dim=(2, 3), keepdim=True) + 1e-8)
-        boundary = torch.clamp(boundary, 0, 1)
+        boundary_max = boundary.amax(dim=(2, 3), keepdim=True)
+        boundary = torch.where(
+            boundary_max > 1e-6,
+            boundary / boundary_max,
+            torch.zeros_like(boundary)
+        )
+        boundary = torch.clamp(boundary, 0.0, 1.0)
 
     elif mode == 'diff':
         # Simple neighbor difference
@@ -56,9 +60,14 @@ def extract_boundary_map(logits, mode='sobel'):
         diff_left = torch.abs(logits_pad[..., :-2, 1:-1] - logits_pad[..., 2:, 1:-1])
         diff_top = torch.abs(logits_pad[..., 1:-1, :-2] - logits_pad[..., 1:-1, 2:])
 
-        # Sum over classes and directions
         boundary = torch.sum(diff_left + diff_top, dim=1, keepdim=True)
-        boundary = torch.clamp(boundary / (boundary.max() + 1e-8), 0, 1)
+        boundary_max = boundary.max()
+        boundary = torch.where(
+            boundary_max > 1e-6,
+            boundary / boundary_max,
+            torch.zeros_like(boundary)
+        )
+        boundary = torch.clamp(boundary, 0.0, 1.0)
 
     elif mode == 'laplacian':
         # Laplacian filter
@@ -70,9 +79,14 @@ def extract_boundary_map(logits, mode='sobel'):
         # Apply to each class
         lap = F.conv2d(logits, laplacian, padding=1, groups=num_channels)
 
-        # Compute absolute values, sum over classes, normalize
         boundary = torch.sum(torch.abs(lap), dim=1, keepdim=True)
-        boundary = torch.clamp(boundary / (boundary.max() + 1e-8), 0, 1)
+        boundary_max = boundary.max()
+        boundary = torch.where(
+            boundary_max > 1e-6,
+            boundary / boundary_max,
+            torch.zeros_like(boundary)
+        )
+        boundary = torch.clamp(boundary, 0.0, 1.0)
 
     else:
         raise ValueError(f"Unknown boundary extraction mode: {mode}")
@@ -110,10 +124,15 @@ def compute_boundary_gt(seg_label, ignore_index=255):
     diff_h = (label_pad[:, :, 1:-1, :-2] != label_pad[:, :, 1:-1, 2:])
     diff_v = (label_pad[:, :, :-2, 1:-1] != label_pad[:, :, 2:, 1:-1])
 
-    mask_ignore = (seg_label != ignore_index).float()
+    # Dilate ignore mask by 1 pixel so that valid pixels adjacent to
+    # ignore regions are also excluded — their neighbor label is unknown,
+    # so the boundary state is undefined there.
+    ignore_mask = (seg_label == ignore_index).float()
+    ignore_dilated = F.max_pool2d(ignore_mask, kernel_size=3, stride=1, padding=1)
+    mask_valid = 1.0 - ignore_dilated
 
     boundary = torch.logical_or(diff_h, diff_v).float()
-    boundary = boundary * mask_ignore
+    boundary = boundary * mask_valid
 
     return boundary
 

@@ -57,15 +57,32 @@ class DAPGLoss(nn.Module):
         # Get dimensions
         n_groups = group_prototypes.shape[0]
 
+        if torch.isnan(group_assignments).any():
+            raise ValueError("DAPGLoss: group_assignments contains NaN")
+        if torch.isnan(group_prototypes).any():
+            raise ValueError("DAPGLoss: group_prototypes contains NaN")
+        if torch.isnan(group_quality).any():
+            raise ValueError("DAPGLoss: group_quality contains NaN")
+
         # Normalize features and prototypes for cosine similarity
         f_norm = F.normalize(features, p=2, dim=1)
+        f_norm = torch.nan_to_num(f_norm, nan=0.0, posinf=0.0, neginf=0.0)
         q_norm = F.normalize(group_prototypes, p=2, dim=1)
+        q_norm = torch.nan_to_num(q_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
         # L_intra: Intra-group compactness
         # Formula: (1/N) * sum_i sum_k A_ik * (1 - cos(F_i, Q_k))
         sim_intra = torch.mm(f_norm, q_norm.t())  # (N, K')
+        sim_intra = torch.clamp(sim_intra, -1.0, 1.0)
         weighted_sim = (sim_intra * group_assignments).sum(dim=1)
         loss_intra = (1.0 - weighted_sim).mean()
+
+        if torch.isnan(loss_intra):
+            raise ValueError(
+                f"DAPGLoss: loss_intra is NaN "
+                f"(sim_intra range=[{sim_intra.min():.4f}, {sim_intra.max():.4f}], "
+                f"assignments range=[{group_assignments.min():.4f}, {group_assignments.max():.4f}])"
+            )
 
         # L_inter: Inter-group separation with margin
         # Formula: (1/K(K-1)) * sum_{g!=h} max(0, cos(Q_g, Q_h) - margin)
@@ -80,13 +97,22 @@ class DAPGLoss(nn.Module):
 
         # L_quality: Quality regularization
         # Formula: -mean(log(quality + epsilon))
-        quality_clamped = torch.clamp(group_quality, min=self.EPS)
+        quality_safe = torch.nan_to_num(group_quality, nan=0.5, posinf=1.0, neginf=0.0)
+        quality_clamped = torch.clamp(quality_safe, min=self.EPS, max=1.0)
         loss_quality = -torch.log(quality_clamped).mean()
 
         # Total loss
         loss_proto = self.loss_weight * (loss_intra +
                                           self.lambda_inter * loss_inter +
                                           self.lambda_quality * loss_quality)
+
+        if torch.isnan(loss_proto):
+            raise ValueError(
+                f"DAPGLoss: NaN detected in loss_proto "
+                f"(intra={loss_intra.item():.4f}, "
+                f"inter={loss_inter.item():.4f}, "
+                f"quality={loss_quality.item():.4f})"
+            )
 
         loss_dict = {
             'loss_intra': loss_intra,

@@ -40,7 +40,7 @@ from mmseg.core import add_prefix
 from mmseg.models import UDA, build_segmentor, build_loss
 from mmseg.models.builder import MODELS
 from mmseg.models.uda.uda_decorator import UDADecorator, get_module
-from mmseg.models.uda.utils.dapcn_utils import (
+from mmseg.models.utils.dapcn_utils import (
     compute_boundary_gt,
     extract_boundary_map,
 )

@@ -21,7 +21,8 @@ from mmseg.core import add_prefix
 from mmseg.models import UDA, build_segmentor, build_loss
 from mmseg.models.builder import MODELS
 from mmseg.models.uda.uda_decorator import UDADecorator, get_module
-from mmseg.models.uda.utils.dapcn_utils import (
+from mmseg.models.uda.dwpc_mixin import DWPCMixin
+from mmseg.models.utils.dapcn_utils import (
     compute_boundary_gt,
     extract_boundary_map,
 )
@@ -30,10 +31,11 @@ from mmseg.models.utils.dacs_transforms import (
     get_mean_std,
     strong_transform,
 )
+from mmseg.models.utils.prototype_memory import PrototypeMemory
 
 
 @UDA.register_module()
-class DAPCN(UDADecorator):
+class DAPCN(DWPCMixin, UDADecorator):
     """Dynamic Attention-based Prototype Clustering Network for UDA.
 
     DAPCN integrates geometry-driven dynamic anchor discovery with
@@ -78,6 +80,11 @@ class DAPCN(UDADecorator):
                  dynamic_anchor=None,
                  dapg_loss=None,
                  affinity_loss=None,
+                 # PrototypeMemory (Witness A) + DWPC dual-witness correction
+                 num_prototypes_per_class=1,
+                 prototype_ema=0.999,
+                 prototype_init_strategy='zeros',
+                 dwpc=None,
                  **cfg):
         super(DAPCN, self).__init__(**cfg)
 
@@ -134,6 +141,59 @@ class DAPCN(UDADecorator):
             ))
 
         self.class_probs = {}
+
+        # --- DWPC dual-witness correction (mixin) ---
+        # Witness A reuses a class-conditioned PrototypeMemory. Unlike the
+        # SSL module, UDA's DAPCN has no contrastive path, so the bank is
+        # created here and updated from source GT + target-confident
+        # pseudo-labels inside forward_train.
+        self.num_prototypes_per_class = num_prototypes_per_class
+        self.proto_to_decoder = None  # Witness A needs no conv_seg bridge
+        self.proto_memory = None
+        decode_head = self.get_model().decode_head
+        num_classes = decode_head.num_classes
+        dwpc_on = bool(dwpc) and dwpc.get('enabled', False)
+        if dwpc_on and dwpc.get('witness_a_enabled', True):
+            in_ch = decode_head.in_channels
+            proto_dim = in_ch[-1] if isinstance(in_ch, (list, tuple)) \
+                else in_ch
+            self.proto_memory = PrototypeMemory(
+                num_classes=num_classes,
+                feature_dim=proto_dim,
+                num_prototypes_per_class=num_prototypes_per_class,
+                ema=prototype_ema,
+                init_strategy=prototype_init_strategy,
+            )
+        self._dwpc_init(dwpc, num_classes)
+
+    def _get_anchor_features(self, encoder_features):
+        """Encoder-space features for Witness A / DynamicAnchor (Solution 1)."""
+        decode_head = self.get_model().decode_head
+        feat = decode_head._transform_inputs(encoder_features)
+        if isinstance(feat, list):
+            feat = feat[-1]
+        return feat
+
+    @torch.no_grad()
+    def _dwpc_update_bank(self, encoder_feat, label, conf_mask=None):
+        """EMA-update PrototypeMemory from a (source or target) feature map."""
+        if self.proto_memory is None:
+            return
+        anchor = self._get_anchor_features(encoder_feat)
+        B, D, Hf, Wf = anchor.shape
+        feats_flat = anchor.permute(0, 2, 3, 1).reshape(-1, D).detach()
+        lab = label.squeeze(1) if label.dim() == 4 else label
+        if lab.shape[-2:] != (Hf, Wf):
+            lab = F.interpolate(lab.float().unsqueeze(1), size=(Hf, Wf),
+                                mode='nearest').long().squeeze(1)
+        mask_flat = None
+        if conf_mask is not None:
+            cm = conf_mask
+            if cm.shape[-2:] != (Hf, Wf):
+                cm = F.interpolate(cm.float().unsqueeze(1), size=(Hf, Wf),
+                                   mode='nearest').squeeze(1).bool()
+            mask_flat = cm.reshape(-1)
+        self.proto_memory.update(feats_flat, lab.reshape(-1), mask=mask_flat)
 
     def _init_dynamic_anchor(self):
         """Build DynamicAnchorModule, auto-detecting feature_dim."""
@@ -262,6 +322,34 @@ class DAPCN(UDADecorator):
 
         return losses
 
+    def _align_affinity_inputs(self, feat, seg_label_resized,
+                               pseudo_weight_resized):
+        """Resize labels (and pseudo_weight) to match feat's spatial dims.
+
+        AffinityBoundaryLoss requires features and seg_label at the same
+        H, W. decoder_features[-1] is the 1/32-scale encoder output while
+        seg_label_resized is at logits resolution (1/4); pseudo_weight may
+        arrive as (B, 1, H, W). Without this alignment the loss errors with
+        a size mismatch / 5D-input. Mirrors DAPCN_SSL._align_affinity_inputs.
+        """
+        _, _, Hf, Wf = feat.shape
+        if seg_label_resized.shape[-2:] != (Hf, Wf):
+            aff_label = F.interpolate(
+                seg_label_resized.float().unsqueeze(1),
+                size=(Hf, Wf), mode='nearest').long().squeeze(1)
+        else:
+            aff_label = seg_label_resized
+        if pseudo_weight_resized is None:
+            return aff_label, None
+        pw = pseudo_weight_resized
+        if pw.dim() == 4:
+            pw = pw.squeeze(1)  # (B, H, W)
+        if pw.shape[-2:] != (Hf, Wf):
+            pw = F.interpolate(
+                pw.unsqueeze(1), size=(Hf, Wf),
+                mode='bilinear', align_corners=False).squeeze(1)
+        return aff_label, pw
+
     def _compute_boundary_loss(self, logits, seg_label_resized,
                                decoder_features, is_source,
                                pseudo_weight_resized):
@@ -279,9 +367,11 @@ class DAPCN(UDADecorator):
             return F.binary_cross_entropy(b_pred, b_gt.float())
 
         elif mode == 'affinity':
+            feat = decoder_features[-1]
+            aff_label, aff_pw = self._align_affinity_inputs(
+                feat, seg_label_resized, pseudo_weight_resized)
             return self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_pw)
 
         elif mode == 'hybrid':
             b_pred = extract_boundary_map(logits, mode=self.boundary_mode)
@@ -293,9 +383,11 @@ class DAPCN(UDADecorator):
                     b_pred, b_gt.float(), weight=w)
             else:
                 binary_l = F.binary_cross_entropy(b_pred, b_gt.float())
+            feat = decoder_features[-1]
+            aff_label, aff_pw = self._align_affinity_inputs(
+                feat, seg_label_resized, pseudo_weight_resized)
             affinity_l = self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_pw)
             hw = self.hybrid_binary_weight
             return hw * binary_l + (1 - hw) * affinity_l
 
@@ -366,6 +458,11 @@ class DAPCN(UDADecorator):
                 log_vars.update(src_dapcn_log)
                 src_dapcn_loss.backward()
 
+        # Warm the Witness-A bank from source GT every iteration so it is
+        # initialised well before dwpc_start_iter.
+        if self.proto_memory is not None:
+            self._dwpc_update_bank(src_feat, gt_semantic_seg)
+
         # === Step 3: Pseudo-label generation ===
         for m in self.get_ema_model().modules():
             if isinstance(m, _DropoutNd):
@@ -379,9 +476,24 @@ class DAPCN(UDADecorator):
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
         ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
         ps_size = np.size(np.array(pseudo_label.cpu()))
-        pseudo_weight = torch.sum(ps_large_p).item() / ps_size
-        pseudo_weight = pseudo_weight * torch.ones(
-            pseudo_prob.shape, device=dev)
+        scalar_pseudo_weight = torch.sum(ps_large_p).item() / ps_size
+
+        # === Step 3b: DWPC dual-witness correction ===
+        need_dwpc = self._dwpc_needed(self.local_iter)
+        if need_dwpc:
+            with torch.no_grad():
+                student_unlab_feat = self.get_model().extract_feat(target_img)
+            # target-confident bank update (raw teacher label)
+            if self.proto_memory is not None:
+                self._dwpc_update_bank(
+                    student_unlab_feat, pseudo_label, conf_mask=ps_large_p)
+            corrected_label, pseudo_weight = self._dwpc_correct(
+                ema_softmax, student_unlab_feat, self.local_iter,
+                scalar_pseudo_weight)
+            pseudo_label = corrected_label
+        else:
+            pseudo_weight = scalar_pseudo_weight * torch.ones(
+                pseudo_prob.shape, device=dev)
 
         if self.psweight_ignore_top > 0:
             pseudo_weight[:, :self.psweight_ignore_top, :] = 0

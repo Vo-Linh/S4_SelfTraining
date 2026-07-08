@@ -33,6 +33,15 @@ uda = dict(
     # --- DAPCN loss weights ---
     boundary_lambda=0.3,
     proto_lambda=0.1,
+    # --- Class-conditioned PrototypeMemory + InfoNCE contrastive ---
+    # Activated on the labeled CE step only (mixed/pseudo features
+    # would corrupt the class-conditioned bank). Set contrastive_lambda
+    # to 0 to disable.
+    contrastive_lambda=0.1,
+    contrastive_temp=0.07,
+    num_prototypes_per_class=1,
+    prototype_ema=0.999,
+    prototype_init_strategy='zeros',
     # --- Boundary configuration ---
     boundary_loss_mode='affinity',
     boundary_mode='sobel',

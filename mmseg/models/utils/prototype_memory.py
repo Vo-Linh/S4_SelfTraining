@@ -99,6 +99,7 @@ class PrototypeMemory(nn.Module):
 
             class_feats = features[class_mask]           # (M, D)
             class_feats = F.normalize(class_feats, dim=1)
+            class_feats = torch.nan_to_num(class_feats, nan=0.0)
 
             s, e = self._class_slice(c)
             class_protos = self.prototypes[s:e]          # (K, D)
@@ -125,6 +126,7 @@ class PrototypeMemory(nn.Module):
                 else:
                     # Cosine similarity routing
                     proto_norm = F.normalize(class_protos, dim=1)
+                    proto_norm = torch.nan_to_num(proto_norm, nan=0.0)
                     sim = torch.mm(class_feats, proto_norm.t())  # (M, K)
                     assign = sim.argmax(dim=1)                   # (M,)
 
@@ -163,7 +165,8 @@ class PrototypeMemory(nn.Module):
 
     def get_all_normalised(self):
         """Return L2-normalised prototypes: (num_classes * K, D)."""
-        return F.normalize(self.prototypes, dim=1)
+        protos = F.normalize(self.prototypes, dim=1)
+        return torch.nan_to_num(protos, nan=0.0)
 
     def is_initialised(self):
         """True once every class has at least one updated prototype."""
@@ -212,8 +215,10 @@ def prototype_contrastive_loss(features,
         return torch.tensor(0.0, device=features.device, requires_grad=True)
 
     feats = F.normalize(features[valid], dim=1)          # (M, D)
+    feats = torch.nan_to_num(feats, nan=0.0)
     labs = labels[valid]                                   # (M,)
     proto_norm = F.normalize(prototypes, dim=1)            # (C*K, D)
+    proto_norm = torch.nan_to_num(proto_norm, nan=0.0)
 
     # Similarity matrix: (M, C*K)
     sim = torch.mm(feats, proto_norm.t()) / temperature
@@ -229,4 +234,82 @@ def prototype_contrastive_loss(features,
         log_probs = F.log_softmax(sim_class, dim=1)        # (M, C)
         loss = -log_probs[torch.arange(len(labs), device=labs.device), labs]
 
+    return loss.mean()
+
+
+def prototype_contrastive_loss_extended(features,
+                                        class_prototypes,
+                                        extra_negatives,
+                                        labels,
+                                        num_classes,
+                                        num_prototypes_per_class=1,
+                                        temperature=0.07,
+                                        ignore_index=255):
+    """InfoNCE with class-conditioned positives and an extra hard-negative bank.
+
+    The standard ``prototype_contrastive_loss`` discriminates each pixel
+    against ``num_classes * K`` class-conditioned prototypes only.  With
+    9 classes and K=1 this is a 9-way classification task — easy to
+    saturate.
+
+    This variant accepts an additional bank of ``M`` *class-agnostic*
+    prototypes (e.g. the dataset-level prototypes from
+    DynamicAnchorModule).  Those prototypes are placed only in the
+    InfoNCE denominator, never as positives, so they act as
+    permanently-hard negatives spanning the feature manifold.  The
+    discrimination task becomes ``(C*K + M)``-way and stays informative
+    long after the class-centroid task plateaus.
+
+    Args:
+        features (Tensor): (N, D) pixel features.
+        class_prototypes (Tensor): (C*K, D) class-conditioned prototypes.
+        extra_negatives (Tensor): (M, D) hard negatives — typically the
+            DynamicAnchorModule prototypes ``.detach()``-ed so the
+            contrastive loss does not reshape the DA geometry.
+        labels (Tensor): (N,) integer class indices.
+        num_classes (int): C.
+        num_prototypes_per_class (int): K. Default: 1.
+        temperature (float): InfoNCE temperature. Default: 0.07.
+        ignore_index (int): Label to ignore. Default: 255.
+
+    Returns:
+        Tensor: Scalar loss.
+    """
+    K = num_prototypes_per_class
+
+    valid = labels != ignore_index
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
+
+    feats = F.normalize(features[valid], dim=1)
+    feats = torch.nan_to_num(feats, nan=0.0)
+    labs = labels[valid]
+
+    cls_p = F.normalize(class_prototypes, dim=1)
+    cls_p = torch.nan_to_num(cls_p, nan=0.0)
+    ext_p = F.normalize(extra_negatives, dim=1)
+    ext_p = torch.nan_to_num(ext_p, nan=0.0)
+
+    # Similarity against class prototypes and extra negatives
+    sim_cls = torch.mm(feats, cls_p.t()) / temperature      # (N, C*K)
+    sim_ext = torch.mm(feats, ext_p.t()) / temperature      # (N, M)
+
+    if K == 1:
+        # Positive logit = the correct class's prototype similarity
+        pos_logit = sim_cls[torch.arange(len(labs), device=labs.device), labs]
+    else:
+        # Multi-prototype hard-positive mining: max over K of the
+        # correct class's prototypes
+        sim_3d = sim_cls.view(-1, num_classes, K)
+        sim_class_max, _ = sim_3d.max(dim=2)                # (N, C)
+        pos_logit = sim_class_max[
+            torch.arange(len(labs), device=labs.device), labs]
+
+    # Denominator: logsumexp over EVERY prototype (class + extra negatives).
+    # No reduction across the K dimension here — each prototype is its
+    # own competing answer, giving the loss a much harder negative pool.
+    all_sim = torch.cat([sim_cls, sim_ext], dim=1)          # (N, C*K + M)
+    log_denom = torch.logsumexp(all_sim, dim=1)             # (N,)
+
+    loss = -(pos_logit - log_denom)
     return loss.mean()

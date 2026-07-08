@@ -107,6 +107,12 @@ def train_segmentor(model,
                                    cfg.checkpoint_config, cfg.log_config,
                                    cfg.get('momentum_config', None))
 
+    # register custom hooks declared in the config (e.g. EmailNotificationHook)
+    custom_hooks = cfg.get('custom_hooks', None)
+    if custom_hooks:
+        for hook_cfg in custom_hooks:
+            runner.register_hook_from_cfg(hook_cfg)
+
     # an ugly walkaround to make the .log and .log.json filenames the same
     runner.timestamp = timestamp
 
@@ -122,7 +128,16 @@ def train_segmentor(model,
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
         eval_hook = DistEvalHook if distributed else EvalHook
-        runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
+        # priority='LOW' (70) ties with IterTimerHook so the eval hook is
+        # ordered *after* it. In mmcv >= 1.4 EvalHook.after_train_iter flushes
+        # the logger and calls log_buffer.clear() before running validation
+        # (mmseg #694). At the default NORMAL (50) the eval hook runs *before*
+        # IterTimerHook, which then re-inserts only 'time' (not 'data_time')
+        # into the just-cleared buffer, so the next TextLoggerHook log crashes
+        # with KeyError: 'data_time'. Registering LOW keeps the buffer empty at
+        # log time and avoids the crash.
+        runner.register_hook(
+            eval_hook(val_dataloader, **eval_cfg), priority='LOW')
 
     if cfg.resume_from:
         runner.resume(cfg.resume_from)
