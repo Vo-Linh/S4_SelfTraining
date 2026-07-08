@@ -39,8 +39,12 @@ def extract_boundary_map(logits, mode='sobel'):
         grad_x = F.conv2d(logits, sobel_x, padding=1, groups=num_channels)
         grad_y = F.conv2d(logits, sobel_y, padding=1, groups=num_channels)
 
-        # Compute gradient magnitude
-        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+        # Compute gradient magnitude. The eps inside the sqrt is essential:
+        # at flat logit regions grad_x == grad_y == 0, and torch.sqrt(0) has an
+        # infinite backward (0.5 / sqrt(0)). Flat regions are abundant, so the
+        # bare sqrt injects Inf -> NaN gradients into conv_seg/decoder/backbone,
+        # which then emit all-NaN features on the next forward.
+        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
 
         boundary = torch.sum(grad_mag, dim=1, keepdim=True)
         boundary_max = boundary.amax(dim=(2, 3), keepdim=True)

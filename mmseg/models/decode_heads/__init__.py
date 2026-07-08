@@ -13,6 +13,7 @@ from .projection_head import ProjectionHead
 from .psp_head import PSPHead
 from .segformer_head import SegFormerHead
 from .sep_aspp_head import DepthwiseSeparableASPPHead
+from .unetformer_head import UNetFormerHead
 from .uper_head import UPerHead
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     'DAPCNHeadMixin',
     'ISAHead',
     'ProjectionHead',
+    'UNetFormerHead',
 ]

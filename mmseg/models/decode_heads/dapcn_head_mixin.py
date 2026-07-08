@@ -18,6 +18,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mmseg.models.builder import MODELS, build_loss
+# NOTE: DynamicAnchorModule is instantiated via the registry (MODELS.build)
+# below, so no direct import is needed here. In this fork the module lives
+# under mmseg.models.uda.dynamic_anchor; a direct top-level import would also
+# risk a circular import through mmseg.models.uda.__init__.
 from mmseg.models.utils.dapcn_utils import (
     compute_boundary_gt,
     extract_boundary_map,
@@ -100,6 +104,8 @@ class DAPCNHeadMixin:
                    num_prototypes_per_class=1,
                    prototype_ema=0.999,
                    prototype_init_strategy='zeros',
+                   lovasz_lambda=0.0,
+                   lovasz_loss=None,
                    dynamic_anchor=None,
                    dapg_loss=None,
                    affinity_loss=None):
@@ -174,9 +180,20 @@ class DAPCNHeadMixin:
         self.contrastive_sample_ratio = contrastive_sample_ratio
         self.warmup_iters = warmup_iters
         self.num_prototypes_per_class = num_prototypes_per_class
+        self.lovasz_lambda = lovasz_lambda
 
         # Iteration counter (updated in forward_train)
         self.register_buffer('_iter', torch.tensor(0, dtype=torch.long))
+
+        # ---- Lovasz-Softmax auxiliary loss (direct mIoU surrogate) ----------
+        # Injected here (not via loss_decode, which is single in this fork).
+        # Gated by lovasz_lambda > 0; inert otherwise.
+        if self.lovasz_lambda > 0:
+            lv_cfg = lovasz_loss.copy() if lovasz_loss else {}
+            lv_cfg.setdefault('type', 'LovaszLoss')
+            lv_cfg.setdefault('loss_type', 'multi_class')
+            lv_cfg.setdefault('per_image', False)
+            self.lovasz_loss_fn = build_loss(lv_cfg)
 
         # ---- Build sub-modules -----------------------------------------------
 
@@ -226,15 +243,17 @@ class DAPCNHeadMixin:
             aff_cfg.setdefault('ignore_index', self.ignore_index)
             self.affinity_loss_fn = build_loss(aff_cfg)
 
-        # 3. Prototype Memory Bank (class-aware)
-        if self.contrastive_lambda > 0:
-            self.proto_memory = PrototypeMemory(
-                num_classes=self.num_classes,
-                feature_dim=self.channels,
-                num_prototypes_per_class=num_prototypes_per_class,
-                ema=prototype_ema,
-                init_strategy=prototype_init_strategy,
-            )
+        # 3. Prototype Memory Bank (class-aware, currently unused —
+        #    unsupervised contrastive uses DA EMA prototypes instead)
+        # if self.contrastive_lambda > 0:
+        #     contrastive_feature_dim = getattr(self, '_da_feature_dim', None) or self.channels
+        #     self.proto_memory = PrototypeMemory(
+        #         num_classes=self.num_classes,
+        #         feature_dim=contrastive_feature_dim,
+        #         num_prototypes_per_class=num_prototypes_per_class,
+        #         ema=prototype_ema,
+        #         init_strategy=prototype_init_strategy,
+        #     )
 
     def dapcn_forward_train(self, inputs, seg_logits, gt_semantic_seg,
                             fused_feature):
@@ -282,12 +301,29 @@ class DAPCNHeadMixin:
             losses.update(dapg_losses)
 
         # ---- 3. Memory-bank contrastive loss --------------------------------
-        if self.contrastive_lambda > 0:
-            contrastive_losses = self._contrastive_loss(fused_feature, gt_resized)
-            for k, v in contrastive_losses.items():
-                if torch.isnan(v):
-                    raise ValueError(f"dapcn_forward_train: {k} is NaN")
-            losses.update(contrastive_losses)
+        # if self.contrastive_lambda > 0:
+        #     contrastive_losses = self._contrastive_loss(fused_feature, gt_resized)
+        #     for k, v in contrastive_losses.items():
+        #         if torch.isnan(v):
+        #             raise ValueError(f"dapcn_forward_train: {k} is NaN")
+        #     losses.update(contrastive_losses)
+
+        # ---- 4. Lovasz-Softmax loss (direct mIoU surrogate) -----------------
+        # Computed at FULL label resolution (logits upsampled bilinearly to the
+        # GT size, matching how BaseDecodeHead.losses() computes CE) so the IoU
+        # surrogate is optimised at the same resolution the metric is measured.
+        if getattr(self, 'lovasz_lambda', 0.0) > 0:
+            seg_logits_full = F.interpolate(
+                seg_logits,
+                size=gt_semantic_seg.shape[2:],
+                mode='bilinear',
+                align_corners=self.align_corners)
+            gt_full = gt_semantic_seg.squeeze(1).long()
+            loss_lovasz = self.lovasz_lambda * self.lovasz_loss_fn(
+                seg_logits_full, gt_full, ignore_index=self.ignore_index)
+            if torch.isnan(loss_lovasz):
+                raise ValueError("dapcn_forward_train: loss_lovasz is NaN")
+            losses['loss_lovasz'] = loss_lovasz
 
         # ---- Advance iteration counter --------------------------------------
         self._iter += 1
@@ -343,7 +379,7 @@ class DAPCNHeadMixin:
             dict: Loss dictionary with 'loss_dapg' and component keys.
         """
         losses = {}
-        B, C, Hf, Wf = da_feat.shape
+        _, C, _, _ = da_feat.shape
 
         if torch.isnan(da_feat).any() or torch.isinf(da_feat).any():
             # Defensive: return zero loss instead of crashing so training
