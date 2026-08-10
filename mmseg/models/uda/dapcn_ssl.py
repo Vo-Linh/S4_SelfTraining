@@ -389,19 +389,30 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             Tensor: Feature map in the appropriate space.
                 Solution 1: encoder features[-1] (in_channels[-1]-d, e.g. 512)
                 Solution 2: fused decoder features (channels-d, e.g. 256)
+
+        Every DAPCN consumer routes through here -- the DAPG loss (which flattens
+        this map into ``feats_flat``), the DynamicAnchorModule EM, and the
+        prototype pseudo-label correction -- so centering here keeps features and
+        prototypes in the same space. Centering inside DynamicAnchorModule alone
+        would leave DAPG comparing raw features against centered prototypes.
         """
         if self.anchor_after_fusion:
             # Solution 2: run features through decoder fusion
             decode_head = self.get_model().decode_head
-            fused = decode_head._fuse_features(encoder_features)
-            return fused
+            feat = decode_head._fuse_features(encoder_features)
         else:
             # Solution 1: use raw encoder features (last scale)
             decode_head = self.get_model().decode_head
             feat = decode_head._transform_inputs(encoder_features)
             if isinstance(feat, list):
                 feat = feat[-1]
-            return feat
+
+        # Centre at the source so the flattened feats_flat handed to DAPGLoss and
+        # the EM input share one space. See DynamicAnchorModule.center().
+        if self.dynamic_anchor is not None:
+            feat = self.dynamic_anchor.center(feat)
+
+        return feat
 
     def _get_pseudo_weight_scale(self):
         """Linear warmup scale for pseudo-label weight.

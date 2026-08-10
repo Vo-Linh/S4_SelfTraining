@@ -333,18 +333,21 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
                 Solution 1: encoder features[-1] (in_channels[-1]-d, e.g. 512)
                 Solution 2: fused decoder features (channels-d, e.g. 256)
         """
+        decode_head = self.get_model().decode_head
         if self.anchor_after_fusion:
             # Solution 2: run features through decoder fusion
-            decode_head = self.get_model().decode_head
-            fused = decode_head._fuse_features(encoder_features)
-            return fused
+            feat = decode_head._fuse_features(encoder_features)
         else:
             # Solution 1: use raw encoder features (last scale)
-            decode_head = self.get_model().decode_head
             feat = decode_head._transform_inputs(encoder_features)
             if isinstance(feat, list):
                 feat = feat[-1]
-            return feat
+
+        # Centre at the source so feats_flat (DAPGLoss) and the EM input share
+        # one space. See DynamicAnchorModule.center().
+        if getattr(self, 'dynamic_anchor', None) is not None:
+            feat = self.dynamic_anchor.center(feat)
+        return feat
 
     def _get_pseudo_weight_scale(self):
         """Linear warmup scale for pseudo-label weight.

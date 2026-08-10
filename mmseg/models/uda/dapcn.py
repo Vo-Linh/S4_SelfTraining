@@ -172,6 +172,9 @@ class DAPCN(DWPCMixin, UDADecorator):
         feat = decode_head._transform_inputs(encoder_features)
         if isinstance(feat, list):
             feat = feat[-1]
+        # Centre at the source; see DynamicAnchorModule.center().
+        if getattr(self, 'dynamic_anchor', None) is not None:
+            feat = self.dynamic_anchor.center(feat)
         return feat
 
     @torch.no_grad()
@@ -309,6 +312,9 @@ class DAPCN(DWPCMixin, UDADecorator):
             if is_source or self.apply_proto_on_target:
                 feat = (decoder_features[-1] if isinstance(
                     decoder_features, list) else decoder_features)
+                # Centre BEFORE flattening, so feats_flat and the EM input share
+                # one space. See DynamicAnchorModule.center().
+                feat = self.dynamic_anchor.center(feat)
                 B, C, Hf, Wf = feat.shape
                 feats_flat = feat.permute(0, 2, 3, 1).reshape(-1, C)
 

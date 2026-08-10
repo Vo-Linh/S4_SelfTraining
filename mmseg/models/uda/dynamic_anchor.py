@@ -80,6 +80,7 @@ class DynamicAnchorModule(BaseModule):
                  use_quality_gate=True,
                  use_mask_predictor=False,
                  ema_decay=0.0,
+                 center_features=True,
                  init_cfg=None):
         super(DynamicAnchorModule, self).__init__(init_cfg)
         self.feature_dim = feature_dim
@@ -89,6 +90,9 @@ class DynamicAnchorModule(BaseModule):
         self.temperature = temperature
         self.init_method = init_method
         self.use_quality_gate = use_quality_gate
+        # See center(): without this the prototypes provably collapse on
+        # anisotropic (transformer) features. Set False only to ablate.
+        self.center_features = center_features
         self.use_mask_predictor = use_mask_predictor
         self.ema_decay = ema_decay
 
@@ -122,6 +126,33 @@ class DynamicAnchorModule(BaseModule):
                 torch.zeros(max_groups, feature_dim))
             self.register_buffer(
                 '_ema_initialised', torch.tensor(False))
+
+    def center(self, feat):
+        """Remove the shared mean direction from an anchor feature map.
+
+        Deep encoder features are strongly anisotropic: a large common mean
+        vector dominates the per-pixel residual, so cos(f_i, f_j) ~= 1 for
+        *every* pixel pair (measured: 0.99999 on MiT-B5 stage-4). The E-step's
+        softmax(f . q / tau) then sees near-constant similarity and assigns
+        uniformly; the M-step recomputes each prototype as a weighted mean of
+        near-identical vectors, so all K prototypes collapse to a single point
+        and stay there. Signature: DAPG ``loss_inter`` pinned at exactly
+        ``relu(1 - margin)``, and the pseudo-label correction degenerating into
+        one constant class prior applied to every pixel.
+
+        Call this where the anchor feature is *obtained*, so the flattened
+        ``feats_flat`` given to DAPGLoss and the EM input live in the same
+        space -- centering only inside the EM would leave DAPG comparing raw
+        features against centered prototypes. The op is idempotent (recentering
+        a centered tensor is a no-op), so ``forward`` also applies it as a
+        safety net for callers that don't.
+
+        Only the DAPCN branch is affected; the segmentation path is untouched.
+        """
+        if not self.center_features:
+            return feat
+        dims = (0, 2, 3) if feat.dim() == 4 else (0,)
+        return feat - feat.mean(dim=dims, keepdim=True)
 
     def _init_prototypes(self):
         """One-time initialisation of the seed prototype tensor."""
@@ -175,6 +206,11 @@ class DynamicAnchorModule(BaseModule):
                 - proto_valid (Tensor): Refined prototypes (K', C).
                 - quality_valid (Tensor): Quality scores (K',).
         """
+        # Idempotent safety net: callers should have centered at the feature
+        # source (so DAPGLoss sees the same space), but if one did not, at
+        # least protect the EM from prototype collapse.
+        features = self.center(features)
+
         B, C, H, W = features.shape
         N = B * H * W
         feats = features.permute(0, 2, 3, 1).reshape(N, C)

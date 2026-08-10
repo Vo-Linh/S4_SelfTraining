@@ -9,6 +9,7 @@ from .dark_zurich import DarkZurichDataset
 from .dataset_wrappers import ConcatDataset, RepeatDataset
 from .gta import GTADataset
 from .openearthmap import OpenEarthMapDataset
+from .loveda import LoveDADataset
 from .synthia import SynthiaDataset
 from .ssl_dataset import SSLDataset
 from .uda_dataset import UDADataset
@@ -24,6 +25,7 @@ __all__ = [
     'CityscapesDataset',
     'GTADataset',
     'OpenEarthMapDataset',
+    'LoveDADataset',
     'SynthiaDataset',
     'UDADataset',
     'SSLDataset',

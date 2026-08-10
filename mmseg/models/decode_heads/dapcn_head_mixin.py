@@ -406,6 +406,10 @@ class DAPCNHeadMixin:
             f"in_channels={self.in_channels}, channels={self.channels}."
         )
 
+        # Centre BEFORE flattening, so feats_flat (DAPGLoss) and the EM input
+        # share one space. See DynamicAnchorModule.center(): without this the
+        # prototypes collapse to a single point on anisotropic features.
+        da_feat = self.dynamic_anchor.center(da_feat)
         feats_flat = da_feat.permute(0, 2, 3, 1).reshape(-1, C)
 
         assign, proto, quality = self.dynamic_anchor(da_feat)

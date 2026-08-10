@@ -11,6 +11,7 @@ from .fcn_head import FCNHead
 from .isa_head import ISAHead
 from .projection_head import ProjectionHead
 from .psp_head import PSPHead
+from .pyramidmamba_head import PyramidMambaHead
 from .segformer_head import SegFormerHead
 from .sep_aspp_head import DepthwiseSeparableASPPHead
 from .unetformer_head import UNetFormerHead
@@ -31,4 +32,5 @@ __all__ = [
     'ISAHead',
     'ProjectionHead',
     'UNetFormerHead',
+    'PyramidMambaHead',
 ]
