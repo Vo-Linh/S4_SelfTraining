@@ -22,13 +22,14 @@ uda = dict(
     # (teacher is unreliable early on with few labeled samples)
     pseudo_label_warmup_iters=1000,
     # --- Prototype-based pseudo-label correction ---
-    # Correct teacher pseudo-labels using prototype class distributions:
-    #   p^c_j = sum_i f_theta(PT_i) * a_ij
-    # Prototypes are projected through conv_seg to obtain class probs,
-    # then blended with the teacher prediction via pixel-prototype
-    # adjacency (soft assignment from DynamicAnchorModule).
+    # Compare each target pixel against the persistent semantic class
+    # prototypes. The nearest prototype per class gives a class distribution
+    # that is blended with the EMA teacher. ``dynamic_anchor`` remains
+    # available to reproduce earlier class-agnostic correction experiments.
     proto_correction=True,
+    proto_correction_mode='class_prototype',
     proto_correction_alpha=0.5,
+    proto_correction_temperature=0.1,
     proto_correction_start_iter=1000,
     # --- DAPCN loss weights ---
     boundary_lambda=0.3,

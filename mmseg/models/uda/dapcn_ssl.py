@@ -139,7 +139,9 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
                  pseudo_label_warmup_iters=0,
                  # Prototype pseudo-label correction
                  proto_correction=True,
+                 proto_correction_mode='class_prototype',
                  proto_correction_alpha=0.5,
+                 proto_correction_temperature=0.1,
                  proto_correction_start_iter=1000,
                  anchor_after_fusion=False,
                  # PrototypeMemory + class-conditioned contrastive loss
@@ -196,7 +198,17 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
 
         # Prototype-based pseudo-label correction
         self.proto_correction = proto_correction
+        if proto_correction_mode not in ('class_prototype', 'dynamic_anchor'):
+            raise ValueError(
+                'proto_correction_mode must be "class_prototype" or '
+                '"dynamic_anchor"')
+        if not 0.0 <= proto_correction_alpha <= 1.0:
+            raise ValueError('proto_correction_alpha must be in [0, 1]')
+        if proto_correction_temperature <= 0:
+            raise ValueError('proto_correction_temperature must be positive')
+        self.proto_correction_mode = proto_correction_mode
         self.proto_correction_alpha = proto_correction_alpha
+        self.proto_correction_temperature = proto_correction_temperature
         self.proto_correction_start_iter = proto_correction_start_iter
         self.anchor_after_fusion = anchor_after_fusion
 
@@ -242,7 +254,8 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
         # Lives in the same feature space DynAnchor uses (encoder[-1] for
         # Solution 1 or fused decoder for Solution 2).
         self.proto_memory = None
-        if self.contrastive_lambda > 0:
+        if (self.contrastive_lambda > 0
+                or self.proto_correction_mode == 'class_prototype'):
             decode_head = self.get_model().decode_head
             num_classes = decode_head.num_classes
             if self.anchor_after_fusion:
@@ -350,26 +363,7 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
                                      (1 - alpha_teacher) * param.data[:])
 
     def train_step(self, data_batch, optimizer, **kwargs):
-        """Single training iteration.
-
-        At ``proto_correction_start_iter``, Adam moment estimates for
-        DynAnchor parameters are reset.  Before this point the module
-        receives zero gradients (proto correction is inactive), so the
-        running first/second moments are biased toward zero.  Resetting
-        them prevents a destabilising spike when gradients suddenly
-        appear.
-        """
-        # Reset Adam state for DynAnchor params at activation boundary
-        if (self.dynamic_anchor is not None
-                and self.local_iter == self.proto_correction_start_iter):
-            for p in self.dynamic_anchor.parameters():
-                if p in optimizer.state:
-                    del optimizer.state[p]
-            if self.proto_to_decoder is not None:
-                for p in self.proto_to_decoder.parameters():
-                    if p in optimizer.state:
-                        del optimizer.state[p]
-
+        """Run one optimizer step without resetting established moments."""
         optimizer.zero_grad()
         log_vars = self(**data_batch)
         optimizer.step()
@@ -426,8 +420,65 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             return 1.0
         return min(1.0, self.local_iter / self.pseudo_label_warmup_iters)
 
-    def _correct_pseudo_labels(self, target_img, target_img_metas,
-                               ema_softmax, student_feat=None):
+    @torch.no_grad()
+    def _correct_pseudo_labels_from_class_prototypes(self, student_feat,
+                                                     ema_softmax):
+        """Blend teacher probabilities with class-prototype evidence.
+
+        Every target pixel is compared against the persistent, semantic
+        ``PrototypeMemory`` bank in the same anchor-feature space. For a
+        class with multiple prototypes, its evidence is the maximum cosine
+        similarity to any of that class's prototypes.
+        """
+        if self.proto_memory is None or not self.proto_memory.is_initialised():
+            self._last_proto_correction_stats = {}
+            return ema_softmax
+
+        feat = self._get_anchor_features(student_feat)
+        B, C, Hf, Wf = feat.shape
+        pixel_features = feat.permute(0, 2, 3, 1).reshape(-1, C)
+        pixel_features = F.normalize(pixel_features, dim=1)
+        pixel_features = torch.nan_to_num(pixel_features, nan=0.0)
+
+        memory = self.proto_memory.get_all_normalised()
+        similarities = torch.mm(pixel_features, memory.t())
+        num_classes = self.proto_memory.num_classes
+        similarities = similarities.reshape(
+            -1, num_classes, self.proto_memory.K)
+        class_scores = similarities.max(dim=2).values
+        prototype_probs = torch.softmax(
+            class_scores / self.proto_correction_temperature, dim=1)
+        prototype_probs = prototype_probs.reshape(
+            B, Hf, Wf, num_classes).permute(0, 3, 1, 2)
+
+        if prototype_probs.shape[-2:] != ema_softmax.shape[-2:]:
+            prototype_probs = F.interpolate(
+                prototype_probs, size=ema_softmax.shape[-2:],
+                mode='bilinear', align_corners=False)
+
+        alpha = self.proto_correction_alpha
+        blended = (1 - alpha) * ema_softmax + alpha * prototype_probs
+        teacher_label = ema_softmax.argmax(dim=1)
+        prototype_label = prototype_probs.argmax(dim=1)
+        corrected_label = blended.argmax(dim=1)
+        update_counts = self.proto_memory.update_counts.reshape(
+            num_classes, self.proto_memory.K)
+        self._last_proto_correction_stats = {
+            'initialized_classes': (
+                update_counts.gt(0).any(dim=1).float().sum()),
+            'mean_updates_per_prototype': update_counts.float().mean(),
+            'mean_nearest_similarity': class_scores.max(dim=1).values.mean(),
+            'teacher_prototype_agreement': (
+                teacher_label == prototype_label).float().mean(),
+            'pseudo_label_flip_rate': (
+                teacher_label != corrected_label).float().mean(),
+        }
+        return blended
+
+    @torch.no_grad()
+    def _correct_pseudo_labels_dynamic_anchor(self, target_img,
+                                              target_img_metas, ema_softmax,
+                                              student_feat=None):
         """Correct pseudo-labels using prototype-derived class distributions.
 
         The DynamicAnchorModule learns K prototypes {PT_i} that capture
@@ -511,6 +562,18 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
 
         return blended
 
+    def _correct_pseudo_labels(self, target_img, target_img_metas,
+                               ema_softmax, student_feat=None):
+        """Dispatch to the configured pseudo-label correction mechanism."""
+        if self.proto_correction_mode == 'class_prototype':
+            if student_feat is None:
+                with torch.no_grad():
+                    student_feat = self.get_model().extract_feat(target_img)
+            return self._correct_pseudo_labels_from_class_prototypes(
+                student_feat, ema_softmax)
+        return self._correct_pseudo_labels_dynamic_anchor(
+            target_img, target_img_metas, ema_softmax, student_feat)
+
     def _compute_dapcn_losses(self, logits, seg_label, decoder_features,
                               is_labeled=True, pseudo_weight=None,
                               unlabeled_decoder_features=None,
@@ -582,8 +645,7 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
         # Skipped on mixed/unlabeled CE step because the query features
         # need reliable supervision; teacher pseudo-labels enter via the
         # memory-bank update path instead, not as queries.
-        if (is_labeled and self.contrastive_lambda > 0
-                and self.proto_memory is not None):
+        if is_labeled and self.proto_memory is not None:
             anchor_feat = self._get_anchor_features(decoder_features)
             _, C_proto, Hf, Wf = anchor_feat.shape
             feats_flat = anchor_feat.permute(0, 2, 3, 1).reshape(-1, C_proto)
@@ -819,6 +881,21 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
         ema_logits = self.get_ema_model().encode_decode(
             target_img, target_img_metas)
         ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
+        self._last_proto_correction_stats = {}
+        if (self.proto_correction_mode == 'class_prototype'
+                and self.proto_memory is not None):
+            counts = self.proto_memory.update_counts.reshape(
+                self.proto_memory.num_classes, self.proto_memory.K)
+            initialized = counts.gt(0).any(dim=1)
+            log_vars.update({
+                'proto_bank.initialized_classes': (
+                    initialized.float().sum().item()),
+                'proto_bank.ready': initialized.all().float().item(),
+                'proto_bank.mean_updates_per_prototype': (
+                    counts.float().mean().item()),
+                'proto_bank.min_updates_per_class': (
+                    counts.sum(dim=1).min().float().item()),
+            })
 
         # Determine whether we need student features on target_img.
         # Shared by (a) v2 contrastive teacher-pseudo-label bank update,
@@ -828,9 +905,12 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             self.contrastive_use_teacher
             and self.proto_memory is not None
             and self.contrastive_lambda > 0)
+        correction_ready = (
+            self.proto_memory is not None
+            if self.proto_correction_mode == 'class_prototype'
+            else self.dynamic_anchor is not None)
         need_proto_correction = (
-            self.proto_correction
-            and self.dynamic_anchor is not None
+            self.proto_correction and correction_ready
             and self.local_iter >= self.proto_correction_start_iter)
         need_dwpc = self._dwpc_needed(self.local_iter)
         student_unlab_feat = None
@@ -843,6 +923,11 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             ema_softmax = self._correct_pseudo_labels(
                 target_img, target_img_metas, ema_softmax,
                 student_feat=student_unlab_feat)
+        if self._last_proto_correction_stats:
+            log_vars.update({
+                f'proto_corr.{name}': value.item()
+                for name, value in self._last_proto_correction_stats.items()
+            })
 
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
         ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
