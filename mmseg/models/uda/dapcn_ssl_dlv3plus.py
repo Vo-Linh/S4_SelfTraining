@@ -545,7 +545,7 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
             raise ValueError(f"Unknown boundary_loss_mode: {mode}")
 
     def forward_train(self, img, img_metas, gt_semantic_seg, target_img,
-                      target_img_metas):
+                      target_img_metas, target_gt_semantic_seg=None):
         """Forward function for semi-supervised training.
 
         Training pipeline:

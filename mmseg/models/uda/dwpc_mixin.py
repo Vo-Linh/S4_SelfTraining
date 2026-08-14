@@ -126,7 +126,13 @@ class DWPCMixin:
         # ---------- Witness A (appearance) ----------
         if self.witness_a_enabled and getattr(self, 'proto_memory', None) \
                 is not None:
-            feat = self._get_anchor_features(student_feat)   # (B,D,Hf,Wf)
+            # Witness-A features must live in the SAME space as the
+            # PrototypeMemory bank. DAPCN_SSL keeps the bank in the fused
+            # decoder space (`_get_proto_features`); the UDA DAPCN falls
+            # back to its own `_get_anchor_features`.
+            getter = getattr(self, '_get_proto_features',
+                             self._get_anchor_features)
+            feat = getter(student_feat)   # (B,D,Hf,Wf)
             Hf, Wf = feat.shape[-2:]
             tl = F.interpolate(pseudo_label.float().unsqueeze(1),
                                size=(Hf, Wf),

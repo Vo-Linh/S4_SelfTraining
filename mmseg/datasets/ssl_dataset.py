@@ -152,7 +152,10 @@ class SSLDataset(object):
         return {
             **s1,
             'target_img_metas': s2['img_metas'],
-            'target_img': s2['img']
+            'target_img': s2['img'],
+            # Hidden GT for the unlabeled image: evaluation-only oracle for
+            # scoring pseudo-label correction. Never used in training.
+            'target_gt_semantic_seg': s2['gt_semantic_seg']
         }
 
     def __getitem__(self, idx):
@@ -164,7 +167,10 @@ class SSLDataset(object):
             return {
                 **s1,
                 'target_img_metas': s2['img_metas'],
-                'target_img': s2['img']
+                'target_img': s2['img'],
+                # Hidden GT for the unlabeled image: evaluation-only oracle for
+                # scoring pseudo-label correction. Never used in training.
+                'target_gt_semantic_seg': s2['gt_semantic_seg']
             }
 
     def __len__(self):

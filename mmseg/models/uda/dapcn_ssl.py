@@ -250,20 +250,26 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
                 loss_weight=1.0,
             ))
 
-        # PrototypeMemory bank for class-conditioned contrastive loss.
-        # Lives in the same feature space DynAnchor uses (encoder[-1] for
-        # Solution 1 or fused decoder for Solution 2).
+        # PrototypeMemory bank for class-conditioned contrastive loss AND
+        # the ``class_prototype`` pseudo-label correction.
+        #
+        # The bank lives in the decoder's FUSED feature space
+        # (``decode_head.channels``-d, 1/4 resolution), NOT the raw
+        # encoder stage-4 space. Measured offline (tools/proto_correction_probe.py):
+        # fused space gives a ~10x larger cosine margin (+0.076 vs +0.007)
+        # and lifts nearest-prototype accuracy 0.45 -> 0.61. This is
+        # independent of ``anchor_after_fusion``, which controls only the
+        # DynamicAnchorModule / DAPG placement.
+        #
+        # NOTE: the bank dim changed from in_channels[-1] (512) to
+        # channels (256), so old checkpoints' ``proto_memory.*`` buffers
+        # will not resume into this layout — start a fresh run.
         self.proto_memory = None
         if (self.contrastive_lambda > 0
                 or self.proto_correction_mode == 'class_prototype'):
             decode_head = self.get_model().decode_head
             num_classes = decode_head.num_classes
-            if self.anchor_after_fusion:
-                proto_dim = decode_head.channels
-            else:
-                in_ch = decode_head.in_channels
-                proto_dim = in_ch[-1] if isinstance(in_ch, (list, tuple)) \
-                    else in_ch
+            proto_dim = decode_head.channels
             self.proto_memory = PrototypeMemory(
                 num_classes=num_classes,
                 feature_dim=proto_dim,
@@ -408,6 +414,33 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
 
         return feat
 
+    def _get_proto_features(self, encoder_features):
+        """Get features in the class-prototype bank's native space.
+
+        The ``PrototypeMemory`` bank and the ``class_prototype``
+        pseudo-label correction operate in the decoder's FUSED feature
+        space (``decode_head.channels``-d, 1/4 resolution), obtained via
+        ``DAFormerHead._fuse_features()``. This is distinct from the
+        DynamicAnchorModule space returned by ``_get_anchor_features``
+        (controlled by ``anchor_after_fusion``).
+
+        The map is centred per batch (subtract the mean over dim (0,2,3))
+        so the cosine geometry between pixels and class centroids is
+        meaningful. Without it the shared common-mode direction dominates
+        and every cosine similarity collapses toward 1 (measured 0.99999
+        on MiT-B5 stage-4; see DynamicAnchorModule.center()).
+
+        Args:
+            encoder_features: Multi-scale encoder features (list of tensors).
+
+        Returns:
+            Tensor: Fused decoder feature map (B, channels, H/4, W/4),
+                centred per batch.
+        """
+        decode_head = self.get_model().decode_head
+        feat = decode_head._fuse_features(encoder_features)
+        return feat - feat.mean(dim=(0, 2, 3), keepdim=True)
+
     def _get_pseudo_weight_scale(self):
         """Linear warmup scale for pseudo-label weight.
 
@@ -434,7 +467,7 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             self._last_proto_correction_stats = {}
             return ema_softmax
 
-        feat = self._get_anchor_features(student_feat)
+        feat = self._get_proto_features(student_feat)
         B, C, Hf, Wf = feat.shape
         pixel_features = feat.permute(0, 2, 3, 1).reshape(-1, C)
         pixel_features = F.normalize(pixel_features, dim=1)
@@ -574,6 +607,73 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
         return self._correct_pseudo_labels_dynamic_anchor(
             target_img, target_img_metas, ema_softmax, student_feat)
 
+    @torch.no_grad()
+    def _eval_pseudo_label_correction(self, raw_label, corrected_label,
+                                      target_gt):
+        """Score raw vs prototype-corrected pseudo-labels against hidden GT.
+
+        The unlabeled ground truth is used purely as an evaluation oracle to
+        measure whether the prototype correction fixes real label noise. It
+        never enters any loss, backward pass, or memory-bank update.
+
+        Reports overall and per-class metrics. For each class ``c`` it emits
+        ``pl_acc.c{c}.raw`` / ``.corrected`` / ``.delta`` (corrected - raw)
+        and ``pl_acc.c{c}.flip_correct`` (fraction of that class's flipped
+        pixels that landed on the correct class; omitted when there were no
+        flips in that class).
+
+        Args:
+            raw_label (Tensor): (B, H, W) teacher pseudo-label *before*
+                correction.
+            corrected_label (Tensor): (B, H, W) pseudo-label *after* the
+                prototype blend (argmax).
+            target_gt (Tensor | None): (B, 1, H, W) or (B, H, W) hidden GT.
+
+        Returns:
+            dict[str, float]: overall + per-class ``pl_acc.*`` metrics.
+            Empty dict when no GT is provided or no valid pixels exist.
+        """
+        if target_gt is None:
+            return {}
+        if target_gt.dim() == 4:
+            target_gt = target_gt.squeeze(1)
+        valid = target_gt != self.ignore_index
+        if not valid.any():
+            return {}
+
+        raw_correct = (raw_label == target_gt) & valid
+        cor_correct = (corrected_label == target_gt) & valid
+        flipped = (raw_label != corrected_label) & valid
+        flip_correct_mask = (corrected_label == target_gt) & flipped
+
+        n_valid = valid.sum().float()
+        out = {
+            'pl_acc.raw': (raw_correct.sum().float() / n_valid).item(),
+            'pl_acc.corrected': (cor_correct.sum().float() / n_valid).item(),
+            'pl_acc.flip_correct': (
+                flip_correct_mask.sum().float()
+                / flipped.sum().float().clamp(min=1.0)).item(),
+        }
+        out['pl_acc.delta'] = out['pl_acc.corrected'] - out['pl_acc.raw']
+
+        for c in range(self.num_classes):
+            cls_mask = (target_gt == c) & valid
+            n_c = cls_mask.sum().float()
+            if n_c.item() == 0:
+                continue
+            raw_c = (raw_correct & cls_mask).sum().float() / n_c
+            cor_c = (cor_correct & cls_mask).sum().float() / n_c
+            out[f'pl_acc.c{c}.raw'] = raw_c.item()
+            out[f'pl_acc.c{c}.corrected'] = cor_c.item()
+            out[f'pl_acc.c{c}.delta'] = (cor_c - raw_c).item()
+            n_flip_c = (flipped & cls_mask).sum().float()
+            if n_flip_c.item() > 0:
+                out[f'pl_acc.c{c}.flip_correct'] = (
+                    (flip_correct_mask & cls_mask).sum().float()
+                    / n_flip_c).item()
+
+        return out
+
     def _compute_dapcn_losses(self, logits, seg_label, decoder_features,
                               is_labeled=True, pseudo_weight=None,
                               unlabeled_decoder_features=None,
@@ -646,7 +746,7 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
         # need reliable supervision; teacher pseudo-labels enter via the
         # memory-bank update path instead, not as queries.
         if is_labeled and self.proto_memory is not None:
-            anchor_feat = self._get_anchor_features(decoder_features)
+            anchor_feat = self._get_proto_features(decoder_features)
             _, C_proto, Hf, Wf = anchor_feat.shape
             feats_flat = anchor_feat.permute(0, 2, 3, 1).reshape(-1, C_proto)
             if seg_label_resized.shape[-2:] != (Hf, Wf):
@@ -670,7 +770,7 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
                     and unlabeled_decoder_features is not None
                     and teacher_pseudo_label is not None
                     and teacher_high_conf_mask is not None):
-                un_anchor = self._get_anchor_features(
+                un_anchor = self._get_proto_features(
                     unlabeled_decoder_features)
                 _, _, Hu, Wu = un_anchor.shape
                 un_feats_flat = un_anchor.permute(
@@ -811,7 +911,7 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             raise ValueError(f"Unknown boundary_loss_mode: {mode}")
 
     def forward_train(self, img, img_metas, gt_semantic_seg, target_img,
-                      target_img_metas):
+                      target_img_metas, target_gt_semantic_seg=None):
         """Forward function for semi-supervised training.
 
         Training pipeline:
@@ -829,6 +929,9 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             gt_semantic_seg (Tensor): Ground truth labels.
             target_img (Tensor): Unlabeled images.
             target_img_metas (list[dict]): Unlabeled image info.
+            target_gt_semantic_seg (Tensor, optional): Hidden GT for the
+                unlabeled images (loaded but never used for training). Used
+                only as an evaluation oracle for ``pl_acc.*`` metrics.
 
         Returns:
             dict[str, Tensor]: Loss components.
@@ -881,6 +984,9 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
         ema_logits = self.get_ema_model().encode_decode(
             target_img, target_img_metas)
         ema_softmax = torch.softmax(ema_logits.detach(), dim=1)
+        # Raw teacher label, captured BEFORE any prototype correction, for
+        # evaluation-only comparison against the hidden unlabeled GT.
+        raw_pseudo_label = ema_softmax.argmax(dim=1)
         self._last_proto_correction_stats = {}
         if (self.proto_correction_mode == 'class_prototype'
                 and self.proto_memory is not None):
@@ -895,6 +1001,7 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
                     counts.float().mean().item()),
                 'proto_bank.min_updates_per_class': (
                     counts.sum(dim=1).min().float().item()),
+                'proto_bank.drift': self.proto_memory.last_drift.item(),
             })
 
         # Determine whether we need student features on target_img.
@@ -930,6 +1037,11 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
             })
 
         pseudo_prob, pseudo_label = torch.max(ema_softmax, dim=1)
+        # Evaluation-only: score raw vs prototype-corrected pseudo-labels
+        # against the hidden unlabeled GT. This GT never enters any loss,
+        # backward pass, or memory-bank update.
+        log_vars.update(self._eval_pseudo_label_correction(
+            raw_pseudo_label, pseudo_label, target_gt_semantic_seg))
         ps_large_p = pseudo_prob.ge(self.pseudo_threshold).long() == 1
         ps_size = np.size(np.array(pseudo_label.cpu()))
         scalar_pseudo_weight = torch.sum(ps_large_p).item() / ps_size
@@ -1016,6 +1128,12 @@ class DAPCN_SSL(DWPCMixin, UDADecorator):
                     tgt_dapcn_losses)
                 log_vars.update(add_prefix(tgt_dapcn_log, 'mix'))
                 tgt_dapcn_loss.backward()
+
+        # Refresh the bank-drift metric once per iteration (after the
+        # labeled-step update has run), so proto_bank.drift reflects the
+        # bank's movement over the last full iteration.
+        if self.proto_memory is not None:
+            self.proto_memory.refresh_drift()
 
         self.local_iter += 1
         return log_vars

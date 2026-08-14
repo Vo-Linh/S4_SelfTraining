@@ -64,6 +64,15 @@ class PrototypeMemory(nn.Module):
         # Per-prototype update counter (for first-update detection)
         self.register_buffer('update_counts', torch.zeros(total))
 
+        # Drift tracking: snapshot of the previous normalized bank and the
+        # cosine drift of the most recent refresh. Non-persistent (recomputed
+        # every iteration, not saved to checkpoints).
+        self.register_buffer('_prev_prototypes',
+                             torch.full((total, feature_dim), float('nan')),
+                             persistent=False)
+        self.register_buffer('last_drift', torch.tensor(float('nan')),
+                             persistent=False)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -175,6 +184,35 @@ class PrototypeMemory(nn.Module):
             if self.update_counts[s] == 0:
                 return False
         return True
+
+    @torch.no_grad()
+    def refresh_drift(self):
+        """Measure how far the bank moved since the previous snapshot.
+
+        Returns the mean cosine distance over prototypes that are
+        initialized (non-zero) in *both* snapshots. All-zero / not-yet-
+        initialized slots are skipped so they don't contribute spurious
+        distance. Call once per training iteration, after ``update()`` has
+        run, so the metric reflects the bank's change over the last full
+        iteration. The scalar is also stored in ``self.last_drift``.
+        """
+        cur = self.get_all_normalised()
+        prev = self._prev_prototypes
+        if torch.isnan(prev).all():
+            drift = cur.new_tensor(0.0)
+        else:
+            prev_valid = prev.norm(dim=1) > self.EPS
+            cur_valid = cur.norm(dim=1) > self.EPS
+            mask = prev_valid & cur_valid
+            if mask.any():
+                cos = (cur[mask] * prev[mask]).sum(dim=1)
+                cos = cos.clamp(min=-1.0, max=1.0)
+                drift = (1.0 - cos).mean()
+            else:
+                drift = cur.new_tensor(0.0)
+        self.last_drift = drift
+        self._prev_prototypes.copy_(cur)
+        return drift
 
 
 def prototype_contrastive_loss(features,

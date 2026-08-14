@@ -28,7 +28,7 @@ uda = dict(
     # available to reproduce earlier class-agnostic correction experiments.
     proto_correction=True,
     proto_correction_mode='class_prototype',
-    proto_correction_alpha=0.5,
+    proto_correction_alpha=0.8,
     proto_correction_temperature=0.1,
     proto_correction_start_iter=1000,
     # --- DAPCN loss weights ---
