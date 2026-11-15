@@ -7,7 +7,12 @@ from copy import deepcopy
 
 from mmcv.parallel import MMDistributedDataParallel
 
-from mmseg.models import BaseSegmentor, build_segmentor
+# Import from the leaf modules rather than the `mmseg.models` package.
+# `mmseg/models/__init__.py` pulls in decode_heads (which reach back into
+# mmseg.models.uda) before it reaches segmentors, so going through the
+# package here makes `import mmseg.models` fail with a circular import.
+from mmseg.models.builder import build_segmentor
+from mmseg.models.segmentors import BaseSegmentor
 
 
 def get_module(module):

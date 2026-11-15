@@ -7,12 +7,10 @@
 
 from .dapcn_utils import (  # noqa: F401
     compute_boundary_gt,
-    contrastive_loss,
     extract_boundary_map,
 )
 
 __all__ = [
     'compute_boundary_gt',
-    'contrastive_loss',
     'extract_boundary_map',
 ]

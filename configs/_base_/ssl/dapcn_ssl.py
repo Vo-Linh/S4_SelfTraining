@@ -36,8 +36,8 @@ uda = dict(
     # --- Boundary configuration ---
     boundary_loss_mode='affinity',
     boundary_mode='sobel',
-    apply_boundary_on_target=True,
-    apply_proto_on_target=True,
+    apply_boundary_on_target=False,
+    apply_proto_on_target=False,
     hybrid_binary_weight=0.5,
     ignore_index=255,
     # --- DynamicAnchorModule ---
@@ -50,7 +50,8 @@ uda = dict(
         min_quality=0.1,
         use_quality_gate=True,
         use_mask_predictor=False,
-        ema_decay=0.0,
+        ema_decay=0.999,   # EMA memory bank: EM starts from dataset-level
+        #                structure instead of rediscovering it per batch
     ),
     # --- DAPGLoss ---
     dapg_loss=dict(

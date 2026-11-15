@@ -22,8 +22,14 @@
 #   3. EMA teacher generates pseudo-labels on unlabeled
 #   3b. Prototype correction refines pseudo-labels (when enabled)
 #   4. ClassMix: labeled patches pasted onto unlabeled
-#   5. Mixed supervised loss
-#   6. DAPCN losses on mixed (target)
+#   5. Mixed supervised loss (confidence- and warmup-weighted)
+#   6. DAPCN losses on mixed — DISABLED BY DEFAULT
+#
+# Loss scope (default): the boundary and prototype (DAPG) losses run
+# on labeled images ONLY.  The mixed branch keeps exactly two
+# mechanisms: prototype-based pseudo-label correction (step 3b) and
+# pseudo-label confidence weighting (steps 3-5).  See dapcn_ssl.py
+# for the full rationale.
 # ---------------------------------------------------------------
 
 import random
@@ -88,9 +94,12 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
         proto_lambda (float): Weight for prototype grouping loss. Default: 0.1.
         boundary_mode (str): Boundary extraction mode. Default: 'sobel'.
         apply_boundary_on_target (bool): Apply boundary loss on unlabeled
-            (mixed) images. Default: True.
+            (mixed) images. Default: False — the boundary loss is
+            restricted to labeled images, where the supervision is clean.
         apply_proto_on_target (bool): Apply prototype loss on unlabeled
-            (mixed) images. Default: True.
+            (mixed) images. Default: False — DAPGLoss has no
+            confidence-weighting mechanism, so on mixed images it would
+            shape the prototypes with unweighted noisy pseudo-labels.
         boundary_loss_mode (str): 'binary', 'affinity', or 'hybrid'.
             Default: 'affinity'.
         hybrid_binary_weight (float): Binary weight in hybrid mode.
@@ -129,8 +138,8 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
                  boundary_lambda=0.3,
                  proto_lambda=0.1,
                  boundary_mode='sobel',
-                 apply_boundary_on_target=True,
-                 apply_proto_on_target=True,
+                 apply_boundary_on_target=False,
+                 apply_proto_on_target=False,
                  boundary_loss_mode='affinity',
                  hybrid_binary_weight=0.5,
                  ignore_index=255,
@@ -358,39 +367,51 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
             return 1.0
         return min(1.0, self.local_iter / self.pseudo_label_warmup_iters)
 
-    def _correct_pseudo_labels(self, target_img, target_img_metas,
-                               ema_softmax):
-        """Correct pseudo-labels using prototype-derived class distributions.
+    def _compute_prototype_probs(self, img, out_hw=None):
+        """Compute prototype-derived class probabilities p^c.
 
         The DynamicAnchorModule learns K prototypes {PT_i} that capture
         dataset-level feature structure without class supervision. By
         passing these prototypes through the decoder's classifier f_theta
         (conv_seg), we obtain per-prototype class distributions.
 
-        The corrected probability for each pixel j is computed as:
+        The prototype-derived probability for each pixel j is:
 
             p^c_j = sum_{i=1}^{K} f_theta(PT_i) * a_ij
 
         where a_ij is the soft assignment (adjacency) between pixel j
         and prototype i, measuring their cosine similarity.
 
-        The final blended probability is:
+        Shared by ``_correct_pseudo_labels`` (training) and
+        ``compute_correction_diagnostics`` (offline debugging) so both
+        paths use exactly the same computation.
 
-            p_final = (1 - alpha) * p_teacher + alpha * p^c
+        Note:
+            Rows of ``assign`` are a softmax over all ``max_groups``
+            prototypes, but the quality gate may drop some of them
+            afterwards without renormalising.  Consequently the rows of
+            ``p^c`` sum to <= 1 rather than exactly 1.  This matches the
+            original behaviour and is harmless for argmax/max, but it is
+            worth keeping in mind when interpreting the blended
+            probabilities.
 
         Args:
-            target_img (Tensor): Unlabeled images (B, 3, H, W).
-            target_img_metas (list[dict]): Image metadata.
-            ema_softmax (Tensor): Teacher's softmax predictions
-                (B, num_classes, H, W).
+            img (Tensor): Input images (B, 3, H, W).
+            out_hw (tuple[int, int], optional): Target spatial size. When
+                given and different from the feature resolution, the
+                result is bilinearly upsampled to it. Default: None.
 
         Returns:
-            Tensor: Corrected softmax probabilities (B, num_classes, H, W).
+            Tensor | None: Probabilities (B, num_classes, H, W), or None
+                if the DynamicAnchorModule is not available.
         """
-        # --- Step 1: Extract student features from unlabeled images ---
+        if self.dynamic_anchor is None:
+            return None
+
+        # --- Step 1: Extract student features ---
         # Use the student model's encoder (no gradient needed for extraction)
         with torch.no_grad():
-            student_feat = self.get_model().extract_feat(target_img)
+            student_feat = self.get_model().extract_feat(img)
 
         # Get features in the appropriate space for DynAnchor
         # Solution 1: encoder[-1] (512-d), Solution 2: fused (256-d)
@@ -402,9 +423,6 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
         #     soft assignments ---
         # assign: (B*Hf*Wf, K), proto: (K, C), quality: (K,)
         assign, proto, quality = self.dynamic_anchor(feat)
-
-        K = proto.shape[0]
-        N = B * Hf * Wf
 
         # --- Step 3: Project prototypes through the classifier f_theta ---
         # Prototypes are in encoder space (in_channels, e.g. 512).
@@ -418,28 +436,110 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
         proto_probs = torch.softmax(
             proto_logits.squeeze(-1).squeeze(-1), dim=1)  # (K, num_classes)
 
-        # --- Step 4: Compute corrected pseudo-label probability ---
+        # --- Step 4: Aggregate per-pixel via the soft assignment ---
         # p^c_j = sum_i a_ij * f_theta(PT_i)
         # assign: (N, K), proto_probs: (K, num_classes)
-        corrected_probs = torch.mm(assign, proto_probs)  # (N, num_classes)
+        proto_pixel_probs = torch.mm(assign, proto_probs)  # (N, num_classes)
 
         # Reshape to spatial format (B, num_classes, Hf, Wf)
-        num_classes = corrected_probs.shape[1]
-        corrected_probs = corrected_probs.reshape(
+        num_classes = proto_pixel_probs.shape[1]
+        proto_pixel_probs = proto_pixel_probs.reshape(
             B, Hf, Wf, num_classes).permute(0, 3, 1, 2)
 
-        # Upsample to match teacher's resolution
-        _, _, H_tea, W_tea = ema_softmax.shape
-        if (Hf, Wf) != (H_tea, W_tea):
-            corrected_probs = F.interpolate(
-                corrected_probs, size=(H_tea, W_tea),
+        # Upsample to the requested resolution
+        if out_hw is not None and (Hf, Wf) != tuple(out_hw):
+            proto_pixel_probs = F.interpolate(
+                proto_pixel_probs, size=tuple(out_hw),
                 mode='bilinear', align_corners=False)
 
-        # --- Step 5: Blend teacher prediction with prototype correction ---
-        alpha = self.proto_correction_alpha
-        blended = (1 - alpha) * ema_softmax + alpha * corrected_probs
+        return proto_pixel_probs
 
-        return blended
+    def _correct_pseudo_labels(self, target_img, target_img_metas,
+                               ema_softmax):
+        """Correct pseudo-labels using prototype-derived class distributions.
+
+        Blends the teacher's prediction with the prototype signal from
+        ``_compute_prototype_probs``:
+
+            p_final = (1 - alpha) * p_teacher + alpha * p^c
+
+        Args:
+            target_img (Tensor): Unlabeled images (B, 3, H, W).
+            target_img_metas (list[dict]): Image metadata.
+            ema_softmax (Tensor): Teacher's softmax predictions
+                (B, num_classes, H, W).
+
+        Returns:
+            Tensor: Corrected softmax probabilities (B, num_classes, H, W).
+        """
+        _, _, H_tea, W_tea = ema_softmax.shape
+        # No gradient can reach these parameters from here: the blended
+        # result is consumed by ``torch.max`` to build pseudo-label
+        # *targets*, never by a loss that is backwarded.  Building the
+        # graph anyway is pure waste — and expensive under
+        # ``anchor_after_fusion=True``, where this call runs a full
+        # decoder fusion at stride 4.
+        with torch.no_grad():
+            proto_probs = self._compute_prototype_probs(
+                target_img, out_hw=(H_tea, W_tea))
+        if proto_probs is None:
+            return ema_softmax
+
+        alpha = self.proto_correction_alpha
+        return (1 - alpha) * ema_softmax + alpha * proto_probs
+
+    @torch.no_grad()
+    def compute_correction_diagnostics(self, img, img_metas):
+        """Return the three pseudo-label signals for offline diagnostics.
+
+        DIAGNOSTIC ONLY — never called from ``forward_train`` and never
+        part of any backward pass.  Used by ``ProtoCorrectionDebugHook``
+        to answer, using the held-out ground truth of nominally
+        unlabeled images:
+
+          1. Is the EMA teacher any good on its own?      -> 'teacher'
+          2. Does the prototype signal carry usable class
+             information on its own?                      -> 'proto'
+          3. Does blending the two beat both components?  -> 'blend'
+
+        The caller is responsible for putting the module in eval mode.
+        This matters: ``DynamicAnchorModule`` mutates its persistent
+        prototypes in-place when ``ema_decay > 0`` and ``self.training``
+        is True, which would make diagnostics perturb training state.
+
+        Args:
+            img (Tensor): Images (B, 3, H, W).
+            img_metas (list[dict]): Image metadata.
+
+        Returns:
+            dict: With keys ``teacher`` (Tensor), ``proto`` (Tensor or
+                None when no DynamicAnchorModule), ``blend`` (Tensor,
+                equal to ``teacher`` when ``proto`` is None) and
+                ``correction_active`` (bool — whether training is
+                currently applying the correction at this iteration).
+        """
+        ema_logits = self.get_ema_model().encode_decode(img, img_metas)
+        p_teacher = torch.softmax(ema_logits, dim=1)
+
+        out_hw = (p_teacher.shape[2], p_teacher.shape[3])
+        p_proto = self._compute_prototype_probs(img, out_hw=out_hw)
+
+        if p_proto is None:
+            p_blend = p_teacher
+        else:
+            alpha = self.proto_correction_alpha
+            p_blend = (1 - alpha) * p_teacher + alpha * p_proto
+
+        correction_active = bool(
+            self.proto_correction
+            and self.dynamic_anchor is not None
+            and self.local_iter >= self.proto_correction_start_iter)
+
+        return dict(
+            teacher=p_teacher,
+            proto=p_proto,
+            blend=p_blend,
+            correction_active=correction_active)
 
     def _compute_dapcn_losses(self, logits, seg_label, decoder_features,
                               is_labeled=True, pseudo_weight=None):
@@ -501,6 +601,35 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
 
         return losses
 
+    def _resize_to_feature(self, feat, seg_label, pseudo_weight):
+        """Match label/weight to a feature map's spatial size.
+
+        The affinity loss compares each pixel of ``feat`` with its
+        neighbours and scores that against label agreement, so the two
+        must live on the same grid. ``seg_label`` arrives at the decode
+        head's output resolution (stride 4), while the feature handed to
+        the affinity loss is the last encoder stage (stride 32) — a 8x
+        difference that has to be reconciled here.
+
+        Args:
+            feat (Tensor): Reference feature map (N, C, H, W).
+            seg_label (Tensor): Labels (N, H', W').
+            pseudo_weight (Tensor | None): Weights (N, 1, H', W').
+
+        Returns:
+            tuple: (seg_label, pseudo_weight) on the feature's grid.
+        """
+        h, w = feat.shape[2], feat.shape[3]
+        if seg_label.shape[-2:] != (h, w):
+            seg_label = F.interpolate(
+                seg_label.float().unsqueeze(1), size=(h, w),
+                mode='nearest').long().squeeze(1)
+        if pseudo_weight is not None and pseudo_weight.shape[-2:] != (h, w):
+            pseudo_weight = F.interpolate(
+                pseudo_weight, size=(h, w), mode='bilinear',
+                align_corners=False)
+        return seg_label, pseudo_weight
+
     def _compute_boundary_loss(self, logits, seg_label_resized,
                                decoder_features, is_labeled,
                                pseudo_weight_resized):
@@ -518,9 +647,11 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
             return F.binary_cross_entropy(b_pred, b_gt.float())
 
         elif mode == 'affinity':
+            feat = decoder_features[-1]
+            aff_label, aff_weight = self._resize_to_feature(
+                feat, seg_label_resized, pseudo_weight_resized)
             return self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_weight)
 
         elif mode == 'hybrid':
             b_pred = extract_boundary_map(logits, mode=self.boundary_mode)
@@ -532,9 +663,11 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
                     b_pred, b_gt.float(), weight=w)
             else:
                 binary_l = F.binary_cross_entropy(b_pred, b_gt.float())
+            feat = decoder_features[-1]
+            aff_label, aff_weight = self._resize_to_feature(
+                feat, seg_label_resized, pseudo_weight_resized)
             affinity_l = self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_weight)
             hw = self.hybrid_binary_weight
             return hw * binary_l + (1 - hw) * affinity_l
 
@@ -568,6 +701,13 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
         batch_size = img.shape[0]
         dev = img.device
         has_dapcn = self.boundary_lambda > 0 or self.proto_lambda > 0
+        # The mixed branch runs the DAPCN losses only if explicitly asked
+        # to (off by default). Tracking it separately matters for memory:
+        # otherwise Step 5 retains the whole mixed-forward graph and Step 6
+        # runs an extra decode-head pass, both to produce nothing.
+        has_dapcn_on_target = (
+            (self.boundary_lambda > 0 and self.apply_boundary_on_target)
+            or (self.proto_lambda > 0 and self.apply_proto_on_target))
 
         # Init/update EMA teacher
         if self.local_iter == 0:
@@ -676,10 +816,10 @@ class DAPCN_SSL_DLV3Plus(UDADecorator):
         tgt_feat = model_output.pop('features')
         target_loss, target_log_vars = self._parse_losses(model_output)
         log_vars.update(add_prefix(target_log_vars, 'mix'))
-        target_loss.backward(retain_graph=has_dapcn)
+        target_loss.backward(retain_graph=has_dapcn_on_target)
 
         # === Step 6: DAPCN losses on mixed (unlabeled) ===
-        if has_dapcn:
+        if has_dapcn_on_target:
             tgt_logits = self.get_model().decode_head(tgt_feat)
             tgt_dapcn_losses = self._compute_dapcn_losses(
                 tgt_logits, mixed_lbl, tgt_feat,

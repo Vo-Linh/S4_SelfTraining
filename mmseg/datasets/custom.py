@@ -19,6 +19,30 @@ from .builder import DATASETS
 from .pipelines import Compose
 
 
+class LazySegMapList:
+    """List-like view over segmentation-map paths that reads on access.
+
+    Exposes only what mmseg's evaluation path uses -- len(), indexing and
+    iteration -- so it is a drop-in replacement for the list of decoded
+    arrays that get_gt_seg_maps used to build, without holding all of them
+    in memory at once.
+    """
+
+    def __init__(self, seg_map_paths):
+        self.seg_map_paths = seg_map_paths
+
+    def __len__(self):
+        return len(self.seg_map_paths)
+
+    def __getitem__(self, idx):
+        return mmcv.imread(
+            self.seg_map_paths[idx], flag='unchanged', backend='pillow')
+
+    def __iter__(self):
+        for idx in range(len(self)):
+            yield self[idx]
+
+
 @DATASETS.register_module()
 class CustomDataset(Dataset):
     """Custom dataset for semantic segmentation. An example of file structure
@@ -234,17 +258,28 @@ class CustomDataset(Dataset):
         """Place holder to format result to dataset specific output."""
 
     def get_gt_seg_maps(self, efficient_test=False):
-        """Get ground truth segmentation maps for evaluation."""
-        gt_seg_maps = []
-        for img_info in self.img_infos:
-            seg_map = osp.join(self.ann_dir, img_info['ann']['seg_map'])
-            if efficient_test:
-                gt_seg_map = seg_map
-            else:
-                gt_seg_map = mmcv.imread(
-                    seg_map, flag='unchanged', backend='pillow')
-            gt_seg_maps.append(gt_seg_map)
-        return gt_seg_maps
+        """Get ground truth segmentation maps for evaluation.
+
+        Returns a lazy sequence rather than a list of loaded arrays: it
+        supports len() and indexing, which is all total_intersect_and_union
+        needs, but holds only the image currently being scored.  Eagerly
+        loading 2000 OpenEarthMap tiles costs ~2 GB of RAM on top of the
+        predictions and, together with the train and val dataloader workers,
+        is enough to get the process OOM-killed on a 15 GB box mid-training.
+
+        Loading fresh on each access is also safer than the old shared list:
+        intersect_and_union mutates the label array in place when
+        reduce_zero_label is set, so a reused list gives different numbers on
+        a second evaluate() call over the same maps.
+        """
+        seg_maps = [
+            osp.join(self.ann_dir, img_info['ann']['seg_map'])
+            for img_info in self.img_infos
+        ]
+        if efficient_test:
+            # intersect_and_union loads str entries itself.
+            return seg_maps
+        return LazySegMapList(seg_maps)
 
     def get_classes_and_palette(self, classes=None, palette=None):
         """Get class names of current dataset.

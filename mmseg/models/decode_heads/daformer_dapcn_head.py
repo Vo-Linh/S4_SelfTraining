@@ -69,6 +69,9 @@ class DAFormerDAPCNHead(DAFormerHead):
         dynamic_anchor (dict | None): Config for DynamicAnchorModule.
         dapg_loss (dict | None): Config for DAPGLoss.
         affinity_loss (dict | None): Config for AffinityBoundaryLoss.
+        log_dapg_diagnostics (bool): Log the detached DAPGLoss
+            sub-components (dapg_cos_mean, ...) each iteration.
+            Default: True.
     """
 
     def __init__(self,
@@ -91,6 +94,8 @@ class DAFormerDAPCNHead(DAFormerHead):
                  dynamic_anchor=None,
                  dapg_loss=None,
                  affinity_loss=None,
+                 # --- Logging ---
+                 log_dapg_diagnostics=True,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -98,6 +103,7 @@ class DAFormerDAPCNHead(DAFormerHead):
         self.boundary_lambda = boundary_lambda
         self.proto_lambda = proto_lambda
         self.contrastive_lambda = contrastive_lambda
+        self.log_dapg_diagnostics = log_dapg_diagnostics
         self.boundary_mode = boundary_mode
         self.boundary_loss_mode = boundary_loss_mode
         self.hybrid_binary_weight = hybrid_binary_weight
@@ -230,21 +236,36 @@ class DAFormerDAPCNHead(DAFormerHead):
 
         return losses
 
-    def _dapg_loss(self, inputs):
-        """Compute dynamic-anchor prototype grouping loss."""
+    def _dapg_loss(self, inputs, update_bank=True):
+        """Compute dynamic-anchor prototype grouping loss.
+
+        Args:
+            update_bank (bool): Forwarded to DynamicAnchorModule under
+                proto_source='memory'.  Defaults to True -- unlike the
+                DAPCN_SSL wrapper (which gates this on `is_labeled` so the
+                bank only absorbs labeled-domain statistics), this head
+                has no unlabeled-vs-labeled distinction of its own: every
+                call to this method is meant to shape the bank.  A caller
+                feeding it unlabeled features (see the two-dataloader
+                supervised+unlabeled-DAPG experiment) passes update_bank
+                explicitly rather than relying on this default.
+        """
         losses = {}
         feat = inputs[-1]                                  # (B, C_enc, H, W)
         B, C, Hf, Wf = feat.shape
         feats_flat = feat.permute(0, 2, 3, 1).reshape(-1, C)
 
-        assign, proto, quality = self.dynamic_anchor(feat)
+        assign, proto, quality = self.dynamic_anchor(feat, update_bank=update_bank)
         loss_proto, proto_dict = self.dapg_loss_fn(
             feats_flat, assign, proto, quality)
 
         losses['loss_dapg'] = self.proto_lambda * loss_proto
-        # Log sub-components (no gradient, informational)
-        for k, v in proto_dict.items():
-            losses[f'dapg_{k}'] = v.detach()
+        # Log sub-components (no gradient, informational). Disabled for
+        # runs that do not read them (e.g. Step 1: X_L only, the Step 2
+        # separation metrics are not meaningful yet).
+        if self.log_dapg_diagnostics:
+            for k, v in proto_dict.items():
+                losses[f'dapg_{k}'] = v.detach()
         return losses
 
     def _contrastive_loss(self, seg_logits, gt_resized, inputs):

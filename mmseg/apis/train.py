@@ -9,7 +9,8 @@ import mmcv
 import numpy as np
 import torch
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import build_optimizer, build_runner
+from mmcv.runner import HOOKS, build_optimizer, build_runner
+from mmcv.utils import build_from_cfg
 
 from mmseg.core import DistEvalHook, EvalHook
 from mmseg.core.ddp_wrapper import DistributedDataParallelWrapper
@@ -34,6 +35,47 @@ def set_random_seed(seed, deterministic=False):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+def build_subset_optimizer(model, optimizer_cfg):
+    """Build an optimizer over a subset of the model's parameters.
+
+    Same ``paramwise_cfg`` rules as mmcv's DefaultOptimizerConstructor,
+    then the parameter groups are filtered by name (names as in
+    ``model.module.named_parameters()``, e.g. ``model.backbone.*``,
+    ``dynamic_anchor.query_proj.weight``):
+
+        param_prefixes    keep only names starting with one of these
+                          (None: keep all)
+        exclude_prefixes  then drop names starting with one of these
+    """
+    from mmcv.runner.optimizer import DefaultOptimizerConstructor
+    from mmcv.runner.optimizer.builder import OPTIMIZERS
+
+    cfg = dict(optimizer_cfg)
+    include = cfg.pop('param_prefixes', None)
+    exclude = tuple(cfg.pop('exclude_prefixes', None) or ())
+    paramwise_cfg = cfg.pop('paramwise_cfg', None) or dict()
+    module = model.module if hasattr(model, 'module') else model
+
+    constructor = DefaultOptimizerConstructor(cfg, paramwise_cfg)
+    groups = []
+    constructor.add_params(groups, module)
+    names = {id(p): n for n, p in module.named_parameters()}
+    keep = []
+    for g in groups:
+        p = g['params'][0]
+        n = names[id(p)]
+        if not p.requires_grad:
+            continue
+        if include is not None and not n.startswith(tuple(include)):
+            continue
+        if exclude and n.startswith(exclude):
+            continue
+        keep.append(g)
+    assert keep, 'optimizer selects no parameter: %r' % (optimizer_cfg, )
+    cfg['params'] = keep
+    return build_from_cfg(cfg, OPTIMIZERS)
 
 
 def train_segmentor(model,
@@ -84,7 +126,22 @@ def train_segmentor(model,
             model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
     # build runner
-    optimizer = build_optimizer(model, cfg.optimizer)
+    # A second optimizer (``optimizer2``) turns the runner's optimizer into
+    # dict(main=..., aux=...); each one holds only the parameters its
+    # ``param_prefixes`` / ``exclude_prefixes`` select.  Without
+    # ``optimizer2`` nothing changes.
+    if cfg.get('optimizer2') is not None:
+        optimizer = dict(
+            main=build_subset_optimizer(model, cfg.optimizer),
+            aux=build_subset_optimizer(model, cfg.optimizer2))
+        for _k, _o in optimizer.items():
+            mmcv.print_log(
+                'optimizer %s: %d params in %d groups' % (
+                    _k, sum(p.numel() for g in _o.param_groups
+                            for p in g['params']), len(_o.param_groups)),
+                'mmseg')
+    else:
+        optimizer = build_optimizer(model, cfg.optimizer)
 
     if cfg.get('runner') is None:
         cfg.runner = {'type': 'IterBasedRunner', 'max_iters': cfg.total_iters}
@@ -107,6 +164,14 @@ def train_segmentor(model,
                                    cfg.checkpoint_config, cfg.log_config,
                                    cfg.get('momentum_config', None))
 
+    # register user-defined hooks (e.g. ProtoCorrectionDebugHook)
+    for hook_cfg in cfg.get('custom_hooks', None) or []:
+        assert isinstance(hook_cfg, dict), \
+            f'Each item in custom_hooks must be a dict, but got {hook_cfg}'
+        hook_cfg = hook_cfg.copy()
+        priority = hook_cfg.pop('priority', 'NORMAL')
+        runner.register_hook(build_from_cfg(hook_cfg, HOOKS), priority=priority)
+
     # an ugly walkaround to make the .log and .log.json filenames the same
     runner.timestamp = timestamp
 
@@ -122,7 +187,16 @@ def train_segmentor(model,
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
         eval_hook = DistEvalHook if distributed else EvalHook
-        runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
+        # priority='LOW' puts EvalHook *after* IterTimerHook. mmcv >=1.4
+        # makes EvalHook flush the logger and then `log_buffer.clear()`
+        # before evaluating; if IterTimerHook runs afterwards it re-adds
+        # 'time' (but not 'data_time', pushed back in before_train_iter)
+        # to the emptied buffer, so TextLoggerHook takes the next line for
+        # a training log and dies on KeyError: 'data_time'.
+        # mmseg 0.16 targets mmcv 1.3.7, which lacks that flush — hence
+        # the stock ordering breaks against the installed mmcv 1.4.0.
+        runner.register_hook(
+            eval_hook(val_dataloader, **eval_cfg), priority='LOW')
 
     if cfg.resume_from:
         runner.resume(cfg.resume_from)

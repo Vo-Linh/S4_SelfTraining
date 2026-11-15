@@ -58,6 +58,15 @@ def single_gpu_test(model,
     model.eval()
     results = []
     dataset = data_loader.dataset
+    # EncoderDecoder.simple_test returns argmax output, which numpy types as
+    # int64 -- 8 bytes per pixel.  This list holds every prediction until the
+    # metric is computed, so a 2000-image val set of 1024x1024 tiles is 16 GB
+    # of RAM and gets the process OOM-killed on a 15 GB box.  (The 100-image
+    # debug split is only 0.8 GB, which is why every earlier run survived.)
+    # Class ids here are 0..num_classes-1, so uint8 is lossless below 256
+    # classes and cuts that to 2 GB; ground truth is already uint8, and
+    # intersect_and_union casts both to float before any arithmetic.
+    compress_preds = dataset.CLASSES is not None and len(dataset.CLASSES) <= 256
     prog_bar = mmcv.ProgressBar(len(dataset))
     if efficient_test:
         mmcv.mkdir_or_exist('.efficient_test')
@@ -92,10 +101,14 @@ def single_gpu_test(model,
                     opacity=opacity)
 
         if isinstance(result, list):
+            if compress_preds:
+                result = [_.astype(np.uint8) for _ in result]
             if efficient_test:
                 result = [np2tmp(_, tmpdir='.efficient_test') for _ in result]
             results.extend(result)
         else:
+            if compress_preds:
+                result = result.astype(np.uint8)
             if efficient_test:
                 result = np2tmp(result, tmpdir='.efficient_test')
             results.append(result)

@@ -262,6 +262,26 @@ class DAPCN(UDADecorator):
 
         return losses
 
+    def _resize_to_feature(self, feat, seg_label, pseudo_weight):
+        """Match label/weight to a feature map's spatial size.
+
+        The affinity loss compares each pixel of ``feat`` with its
+        neighbours and scores that against label agreement, so the two
+        must live on the same grid. ``seg_label`` arrives at the decode
+        head's output resolution (stride 4), while the feature handed to
+        the affinity loss is the last encoder stage (stride 32).
+        """
+        h, w = feat.shape[2], feat.shape[3]
+        if seg_label.shape[-2:] != (h, w):
+            seg_label = F.interpolate(
+                seg_label.float().unsqueeze(1), size=(h, w),
+                mode='nearest').long().squeeze(1)
+        if pseudo_weight is not None and pseudo_weight.shape[-2:] != (h, w):
+            pseudo_weight = F.interpolate(
+                pseudo_weight, size=(h, w), mode='bilinear',
+                align_corners=False)
+        return seg_label, pseudo_weight
+
     def _compute_boundary_loss(self, logits, seg_label_resized,
                                decoder_features, is_source,
                                pseudo_weight_resized):
@@ -279,9 +299,11 @@ class DAPCN(UDADecorator):
             return F.binary_cross_entropy(b_pred, b_gt.float())
 
         elif mode == 'affinity':
+            feat = decoder_features[-1]
+            aff_label, aff_weight = self._resize_to_feature(
+                feat, seg_label_resized, pseudo_weight_resized)
             return self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_weight)
 
         elif mode == 'hybrid':
             b_pred = extract_boundary_map(logits, mode=self.boundary_mode)
@@ -293,9 +315,11 @@ class DAPCN(UDADecorator):
                     b_pred, b_gt.float(), weight=w)
             else:
                 binary_l = F.binary_cross_entropy(b_pred, b_gt.float())
+            feat = decoder_features[-1]
+            aff_label, aff_weight = self._resize_to_feature(
+                feat, seg_label_resized, pseudo_weight_resized)
             affinity_l = self.affinity_loss_fn(
-                decoder_features[-1], seg_label_resized,
-                pseudo_weight=pseudo_weight_resized)
+                feat, aff_label, pseudo_weight=aff_weight)
             hw = self.hybrid_binary_weight
             return hw * binary_l + (1 - hw) * affinity_l
 

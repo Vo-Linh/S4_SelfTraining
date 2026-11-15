@@ -69,8 +69,8 @@ class DAPGLoss(nn.Module):
 
         # L_inter: Inter-group separation with margin
         # Formula: (1/K(K-1)) * sum_{g!=h} max(0, cos(Q_g, Q_h) - margin)
+        sim_inter = torch.mm(q_norm, q_norm.t())  # (K', K')
         if n_groups > 1:
-            sim_inter = torch.mm(q_norm, q_norm.t())  # (K', K')
             mask = 1.0 - torch.eye(n_groups, device=sim_inter.device)
             margin_violations = F.relu(sim_inter - self.margin) * mask
             loss_inter = margin_violations.sum() / (n_groups *
@@ -88,10 +88,36 @@ class DAPGLoss(nn.Module):
                                           self.lambda_inter * loss_inter +
                                           self.lambda_quality * loss_quality)
 
+        # --- Diagnostics -------------------------------------------------
+        # Detached, and deliberately named WITHOUT the substring 'loss'.
+        # `BaseSegmentor._parse_losses` sums every entry whose key contains
+        # 'loss', so returning the components under names like
+        # 'loss_intra' made them land in the optimised total a second time,
+        # on top of `loss_proto` — giving intra/inter/quality effective
+        # weights of 1.1 / 1.05 / 1.01 instead of the configured
+        # 0.1 / 0.05 / 0.01.
+        with torch.no_grad():
+            if n_groups > 1:
+                off_diag = sim_inter[~torch.eye(
+                    n_groups, dtype=torch.bool, device=sim_inter.device)]
+                cos_mean = off_diag.mean()
+                cos_max = off_diag.max()
+                # Share of prototype pairs that are closer than the margin
+                # allows — a direct read on how redundant the bank is.
+                frac_over = (off_diag > self.margin).float().mean()
+            else:
+                zero = torch.zeros((), device=features.device)
+                cos_mean, cos_max, frac_over = zero, zero, zero
+
         loss_dict = {
-            'loss_intra': loss_intra,
-            'loss_inter': loss_inter,
-            'loss_quality': loss_quality,
+            'intra': loss_intra.detach(),
+            'inter': loss_inter.detach(),
+            'quality': loss_quality.detach(),
+            'n_groups': torch.tensor(
+                float(n_groups), device=features.device),
+            'cos_mean': cos_mean,
+            'cos_max': cos_max,
+            'frac_over_margin': frac_over,
         }
 
         return loss_proto, loss_dict
